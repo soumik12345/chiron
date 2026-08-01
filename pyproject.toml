@@ -5,11 +5,19 @@ description = "Gameplay assitant for the 21st century"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "google-genai>=1.51.0",
     "httpx>=0.28.1",
     "litellm>=1.94.1",
+    "mss>=10.1.0",
+    "pillow>=11.0.0",
     "pyside6>=6.11.1",
+    "python-xlib>=0.33",
+    "qasync>=0.28.0",
     "weave>=0.53.4",
 ]
+
+[project.scripts]
+chiron = "chiron.app:main"
 
 [dependency-groups]
 dev = [
