@@ -1,6 +1,6 @@
-"""Two ways to fill the journal, behind one interface.
+"""Ways to fill the journal, behind one interface.
 
-Both writers append to the same :class:`~chiron.journal.log.JournalLog`, so the
+Every writer appends to the same :class:`~chiron.journal.log.JournalLog`, so the
 choice is invisible to the rest of the app — it is a setting, not an
 architecture:
 
@@ -12,6 +12,15 @@ architecture:
   asks a cheap regular Gemini model to distil the recent transcript and a handful
   of kept frames into entries. Cleaner separation and easier to tune, at the cost
   of extra calls.
+* :class:`ObserverJournal` does nothing on its own. It is what non-live mode
+  uses, where the observer already *is* the journal writer — it runs on the
+  screen's own events rather than a timer, and it has the frames and the
+  conversation in hand — so the writer's remaining job is the one thing the
+  observer cannot do for itself: hand each entry to the UI callback.
+
+The strategy setting therefore applies to live mode only. In non-live mode there
+is no session to evict frames from and no second summariser worth paying for;
+the journal is primary memory rather than insurance, and the observer fills it.
 
 The sidecar reuses the repo's existing :class:`~chiron.models.litellm_model.LiteLLMModel`
 wrapper rather than opening a second Google client, which means its spend lands
@@ -139,10 +148,24 @@ class JournalWriter(ABC):
     async def stop(self) -> None:
         """Stop background work and release resources. No-op by default."""
 
-    def _record(
-        self, note: str, category: str, *, timestamp: float | None = None
+    def record(
+        self, note: str, category: str = "note", *, timestamp: float | None = None
     ) -> JournalEntry | None:
-        """Append to the log and notify the UI callback."""
+        """Append to the log and notify the UI callback.
+
+        Public because the non-live observer produces entries from outside any
+        writer — it is the one strategy whose work happens in the session
+        manager — and still needs them to reach the overlay the same way.
+
+        Args:
+            note (str): What happened, in one sentence. Blank notes are ignored.
+            category (str): Loose bucket from
+                :data:`~chiron.journal.log.CATEGORIES`.
+            timestamp (float | None): Event time; defaults to now.
+
+        Returns:
+            JournalEntry | None: The stored entry, or None for a blank note.
+        """
         entry = self.log.append(
             note, category=category, source=self.name, timestamp=timestamp
         )
@@ -171,10 +194,30 @@ class ToolCallJournal(JournalWriter):
             return await super().handle_tool_call(name, args)
         note = str(args.get("note") or "")
         category = str(args.get("category") or "note")
-        entry = self._record(note, category)
+        entry = self.record(note, category)
         if entry is None:
             return {"status": "ignored", "reason": "empty note"}
         return {"status": "recorded", "at": entry.clock}
+
+
+class ObserverJournal(JournalWriter):
+    """The non-live journal: entries arrive from the observer, not from here.
+
+    A writer with nothing to write may look like a hole in the design, but the
+    alternative is worse. Non-live mode's observer already holds everything a
+    journal strategy would need — the frame ring buffer, the conversation, the
+    trigger that decides when looking is worth paying for — so a second thing
+    summarising the same material on a timer would be duplicated cost for
+    duplicated entries. What survives is the part the observer genuinely cannot
+    supply itself: a shared route to the log and the overlay callback, so an
+    entry looks the same in the transcript whichever mode produced it.
+
+    Installing nothing into the session is also load-bearing: a non-live
+    provider has no function declarations to install and no background loop to
+    stop, and both of those are inherited no-ops.
+    """
+
+    name = "observer"
 
 
 class SidecarJournal(JournalWriter):
@@ -289,7 +332,7 @@ class SidecarJournal(JournalWriter):
 
         entries: list[JournalEntry] = []
         for note, category in parse_sidecar_entries(content):
-            entry = self._record(note, category)
+            entry = self.record(note, category)
             if entry is not None:
                 entries.append(entry)
 
@@ -397,18 +440,26 @@ def build_journal_writer(
     *,
     api_key: str = "",
     on_entry: EntryCallback | None = None,
+    live: bool = True,
 ) -> JournalWriter:
-    """Create the writer named by `settings.strategy`.
+    """Create the writer the current mode and strategy call for.
 
     Args:
         settings (JournalSettings): Journal configuration.
         log (JournalLog): The shared log.
         api_key (str): Google credential for the sidecar model.
         on_entry (EntryCallback | None): Per-entry UI callback.
+        live (bool): Whether a Live API session is in force. The strategy
+            setting only means something there; a non-live provider always
+            journals through its observer, so the setting is ignored rather
+            than being allowed to install a sidecar that would duplicate it.
 
     Returns:
-        JournalWriter: A :class:`SidecarJournal` or :class:`ToolCallJournal`.
+        JournalWriter: An :class:`ObserverJournal`, :class:`SidecarJournal` or
+            :class:`ToolCallJournal`.
     """
+    if not live:
+        return ObserverJournal(log, on_entry)
     if settings.strategy == "sidecar":
         return SidecarJournal(log, settings, api_key=api_key, on_entry=on_entry)
     return ToolCallJournal(log, on_entry)
@@ -418,6 +469,7 @@ __all__ = [
     "RECORD_EVENT_DECLARATION",
     "SIDECAR_SYSTEM_PROMPT",
     "JournalWriter",
+    "ObserverJournal",
     "SidecarJournal",
     "ToolCallJournal",
     "build_journal_writer",

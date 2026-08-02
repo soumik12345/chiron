@@ -18,6 +18,11 @@ Two things are surfaced rather than hidden, because both are load-bearing and
 both are invisible in a chat window otherwise: the estimated token burn implied
 by the capture settings, and which journal strategy is in force with an honest
 account of what each one costs you.
+
+**One dropdown decides the mode.** Picking a live model runs the Live API; picking
+anything else runs the non-live provider. Since that one choice silently rewires
+which pages matter, the form says so out loud: settings that only apply in the
+other mode are disabled with a reason rather than left enabled and inert.
 """
 
 from __future__ import annotations
@@ -53,14 +58,17 @@ from PySide6.QtWidgets import (
 
 from chiron.capture.frames import describe_monitors
 from chiron.config.settings import (
+    DETAIL_CAPTURE_WIDTH,
     LIVE_CONTEXT_TOKENS,
-    LIVE_MODEL_CHOICES,
     SIDECAR_MODEL_CHOICES,
     OverlaySettings,
     Settings,
     default_settings_path,
+    is_live_selection,
 )
+from chiron.models.catalogue import STATIC_MODELS, available_models, find_model
 from chiron.ui.hotkeys import HotkeyError, normalise_hotkey
+from chiron.ui.model_picker import ModelPicker
 from chiron.ui.theme import PALETTE, settings_stylesheet
 
 logger = logging.getLogger(__name__)
@@ -148,12 +156,16 @@ class SettingsWindow(QWidget):
         # Nothing reacts until every page is in place.
         self._ready = False
         self._widgets: dict[str, Any] = {}
+        # Something to choose from before any network call returns — and the
+        # fallback if none ever does.
+        self._models: list[Any] = list(STATIC_MODELS)
 
-        self.setWindowTitle("Chiron — Settings")
+        self.setWindowTitle("Chiron Settings")
         self.setStyleSheet(settings_stylesheet())
         self.resize(880, 640)
         self._build_ui()
         self._ready = True
+        self.set_models(self._models)
         self.load(self.settings)
 
     # ----------------------------------------------------------------- build
@@ -180,6 +192,7 @@ class SettingsWindow(QWidget):
         for title, builder in (
             ("Session", self._build_session_page),
             ("Capture", self._build_capture_page),
+            ("Observer", self._build_observer_page),
             ("Journal", self._build_journal_page),
             ("Overlay", self._build_overlay_page),
             ("Hotkeys", self._build_hotkeys_page),
@@ -322,21 +335,54 @@ class SettingsWindow(QWidget):
             form,
             "Leave blank to use GEMINI_API_KEY (or GOOGLE_API_KEY) from the "
             "environment. Saved keys are written to the settings file with "
-            "owner-only permissions. Get one at aistudio.google.com/apikey.",
+            "owner-only permissions. Get one at aistudio.google.com/apikey. "
+            "This one key covers both the Live API and Google AI Studio.",
+        )
+
+        openrouter_row = QHBoxLayout()
+        self.openrouter_key_edit = self._register(
+            "openrouter_api_key", QLineEdit(), "textEdited"
+        )
+        self.openrouter_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.openrouter_key_edit.setPlaceholderText("sk-or-v1-…")
+        openrouter_row.addWidget(self.openrouter_key_edit, stretch=1)
+
+        openrouter_reveal = QPushButton("Show")
+        openrouter_reveal.setCheckable(True)
+        openrouter_reveal.toggled.connect(
+            lambda shown: self.openrouter_key_edit.setEchoMode(
+                QLineEdit.EchoMode.Normal if shown else QLineEdit.EchoMode.Password
+            )
+        )
+        openrouter_row.addWidget(openrouter_reveal)
+        form.addRow("OpenRouter API key", openrouter_row)
+        self._hint(
+            form,
+            "Optional. A provider is activated by supplying its key, so with "
+            "this blank OpenRouter's models simply do not appear below. Falls "
+            "back to OPENROUTER_API_KEY. Get one at openrouter.ai/keys.",
         )
 
         form = self._section(layout, "Model")
-        self.live_model_combo = self._register(
-            "live_model", QComboBox(), "currentTextChanged"
+        model_row = QHBoxLayout()
+        self.model_picker = self._register("model", ModelPicker(), "selectionChanged")
+        model_row.addWidget(self.model_picker, stretch=1)
+        self.refresh_models_button = QPushButton("Refresh")
+        self.refresh_models_button.setToolTip(
+            "Re-fetch the model lists from the providers you have keys for."
         )
-        self.live_model_combo.setEditable(True)
-        self.live_model_combo.addItems(LIVE_MODEL_CHOICES)
-        form.addRow("Live model", self.live_model_combo)
+        self.refresh_models_button.clicked.connect(
+            lambda: self.refresh_catalogue(force=True)
+        )
+        model_row.addWidget(self.refresh_models_button)
+        form.addRow("Model", model_row)
+        self.model_note_label = self._hint(form, "")
         self._hint(
             form,
-            "Must be a Live API model. These models answer in speech; Chiron "
-            "reads their own transcription, so the panel stays text and no audio "
-            "is ever played. Output is billed as audio tokens.",
+            "This one choice sets the mode. A live model streams frames over a "
+            "websocket and watches continuously; a non-live one is called on "
+            "demand and keeps a journal between calls. Search by name or vendor, "
+            "or paste a model id no catalogue lists yet.",
         )
 
         self.media_res_combo = self._register(
@@ -344,10 +390,41 @@ class SettingsWindow(QWidget):
         )
         self.media_res_combo.addItems(["low", "medium", "high"])
         form.addRow("Frame detail", self.media_res_combo)
+        self.detail_note_label = self._hint(form, "")
+
+        form = self._section(layout, "Agents")
+        self.agent_group = QButtonGroup(self)
+        self.unified_radio = QRadioButton("Unified: one model does both")
+        self.unified_radio.setObjectName("strategy")
+        self.split_radio = QRadioButton("Split: cheap observer, smart answerer")
+        self.split_radio.setObjectName("strategy")
+        self.agent_group.addButton(self.unified_radio, 0)
+        self.agent_group.addButton(self.split_radio, 1)
+        self.agent_group.idToggled.connect(self._on_field_changed)
+
+        form.addRow("", self.unified_radio)
         self._hint(
             form,
-            "How many tokens each frame costs the context window: roughly 260 at "
-            "low, and proportionally more above that.",
+            "The observer's ticks go into the same conversation your questions "
+            "do, so answers come from a model that has actually been watching. "
+            "Every tick pays for the whole conversation.",
+        )
+        form.addRow("", self.split_radio)
+        self._hint(
+            form,
+            "The observer becomes a separate, near-stateless call against its "
+            "own model. Cheaper to watch with; the answering model then knows "
+            "only the journal and your conversation.",
+        )
+
+        self.observer_model_picker = self._register(
+            "observer_model",
+            ModelPicker(allow_empty=True, empty_label="Use the model chosen above"),
+            "selectionChanged",
+        )
+        form.addRow("Observer model", self.observer_model_picker)
+        self.agent_note_label = self._hint(
+            form, "Leave blank to observe with the model chosen above."
         )
 
         form = self._section(layout, "Instructions")
@@ -365,7 +442,7 @@ class SettingsWindow(QWidget):
             "extra_prompt", QPlainTextEdit(), "textChanged"
         )
         self.extra_prompt_edit.setPlaceholderText(
-            "e.g. I'm playing blind — never spoil anything I haven't found yet."
+            "e.g. I'm playing blind, so never spoil anything I haven't found yet."
         )
         self.extra_prompt_edit.setFixedHeight(90)
         form.addRow("Extra instructions", self.extra_prompt_edit)
@@ -449,7 +526,7 @@ class SettingsWindow(QWidget):
         self._hint(
             form,
             "A cheap pixel diff catches loading screens, new areas and death "
-            "screens — the moments most worth recording.",
+            "screens: the moments most worth recording.",
         )
 
         threshold_row = QHBoxLayout()
@@ -466,6 +543,7 @@ class SettingsWindow(QWidget):
         self._hint(form, "Lower fires more often. 12% suits most games.")
 
         form = self._section(layout, "Encoding")
+        self.encoding_form = form
         self.frame_width_spin = self._register(
             "frame_width", QSpinBox(), "valueChanged"
         )
@@ -473,6 +551,10 @@ class SettingsWindow(QWidget):
         self.frame_width_spin.setSingleStep(64)
         self.frame_width_spin.setSuffix(" px")
         form.addRow("Frame width", self.frame_width_spin)
+        # Hidden rather than disabled in non-live mode: frame detail *is* the
+        # width there, and two dials on the same pixels would only let them
+        # disagree. The hint that replaces it says which width detail chose.
+        self.frame_width_note_label = self._hint(form, "")
 
         self.jpeg_quality_spin = self._register(
             "jpeg_quality", QSpinBox(), "valueChanged"
@@ -488,6 +570,100 @@ class SettingsWindow(QWidget):
             form,
             "Gives the model an explicit clock, so 'the chest you saw earlier' "
             "has a when. Recommended.",
+        )
+
+        layout.addStretch(1)
+        return page
+
+    def _build_observer_page(self) -> QWidget:
+        """When a non-live provider decides the screen is worth paying to read."""
+        page, layout = self._page(
+            "Observer",
+            "In non-live mode nothing is watching between your questions unless "
+            "the observer looks, and every look is a billed call. These settings "
+            "are what stands between an attentive assistant and an expensive one.",
+        )
+
+        self.observer_mode_label = QLabel("")
+        self.observer_mode_label.setObjectName("hint")
+        self.observer_mode_label.setWordWrap(True)
+        layout.addWidget(self.observer_mode_label)
+
+        form = self._section(layout, "Triggers")
+        self.trigger_group = QButtonGroup(self)
+        self.gated_radio = QRadioButton("Spikes, plus a heartbeat that can skip")
+        self.gated_radio.setObjectName("strategy")
+        self.plain_radio = QRadioButton("Spikes, plus a heartbeat that always fires")
+        self.plain_radio.setObjectName("strategy")
+        self.trigger_group.addButton(self.gated_radio, 0)
+        self.trigger_group.addButton(self.plain_radio, 1)
+        self.trigger_group.idToggled.connect(self._on_field_changed)
+
+        form.addRow("", self.gated_radio)
+        self._hint(
+            form,
+            "The periodic tick checks whether anything has drifted since the "
+            "last look and skips the call when nothing has. Best cost profile: "
+            "an idle menu screen costs nothing at all.",
+        )
+        form.addRow("", self.plain_radio)
+        self._hint(
+            form,
+            "The tick always fires. A simpler guarantee that the journal keeps "
+            "moving, at a small steady cost while you are idle.",
+        )
+
+        form = self._section(layout, "Cadence")
+        self.cooldown_spin = self._register(
+            "cooldown", QDoubleSpinBox(), "valueChanged"
+        )
+        self.cooldown_spin.setRange(5.0, 600.0)
+        self.cooldown_spin.setSingleStep(5.0)
+        self.cooldown_spin.setSuffix(" s")
+        form.addRow("Minimum gap", self.cooldown_spin)
+        self._hint(
+            form,
+            "The ceiling on observer spend. However busy the screen gets, no "
+            "sequence of triggers can produce calls faster than this.",
+        )
+
+        self.heartbeat_spin = self._register(
+            "heartbeat", QDoubleSpinBox(), "valueChanged"
+        )
+        self.heartbeat_spin.setRange(15.0, 900.0)
+        self.heartbeat_spin.setSingleStep(15.0)
+        self.heartbeat_spin.setSuffix(" s")
+        form.addRow("Heartbeat every", self.heartbeat_spin)
+
+        form = self._section(layout, "Sensitivity")
+        sensitivity_row = QHBoxLayout()
+        self.sensitivity_slider = self._register(
+            "spike_sensitivity", QSlider(Qt.Orientation.Horizontal), "valueChanged"
+        )
+        self.sensitivity_slider.setRange(10, 100)
+        sensitivity_row.addWidget(self.sensitivity_slider, stretch=1)
+        self.sensitivity_value_label = QLabel("")
+        self.sensitivity_value_label.setObjectName("hint")
+        self.sensitivity_value_label.setFixedWidth(48)
+        sensitivity_row.addWidget(self.sensitivity_value_label)
+        form.addRow("Spike threshold", sensitivity_row)
+        self._hint(
+            form,
+            "How far a frame must depart from how the screen has *been* changing "
+            "to count as an event. Higher is more conservative. Idle animation "
+            "(grass, water, a looping menu) is discounted automatically, so this "
+            "does not have to be raised to survive a pretty game.",
+        )
+
+        self.observer_frames_spin = self._register(
+            "observer_frames", QSpinBox(), "valueChanged"
+        )
+        self.observer_frames_spin.setRange(1, 8)
+        form.addRow("Frames per look", self.observer_frames_spin)
+        self._hint(
+            form,
+            "The newest frame plus the moments that triggered the look. More "
+            "context per call, and more tokens per call.",
         )
 
         layout.addStretch(1)
@@ -516,7 +692,7 @@ class SettingsWindow(QWidget):
             form,
             "The live model gets a record_event function and calls it when "
             "something notable happens. No extra API calls, and one model holds "
-            "the whole picture — but journalling competes with the conversation.",
+            "the whole picture, but journalling competes with the conversation.",
         )
         form.addRow("", self.sidecar_radio)
         self._hint(
@@ -574,7 +750,7 @@ class SettingsWindow(QWidget):
         form.addRow("Entries kept", self.max_entries_spin)
         self._hint(
             form,
-            "The journal lives in memory only — v0 does not persist it between runs.",
+            "The journal lives in memory only; v0 does not persist it between runs.",
         )
 
         layout.addStretch(1)
@@ -664,7 +840,7 @@ class SettingsWindow(QWidget):
         self._hint(
             form,
             "Optional separate keys, for when you would rather not have to know "
-            "the current state — particularly to be certain you have stopped.",
+            "the current state, particularly to be certain you have stopped.",
         )
 
         form = self._section(layout, "Window")
@@ -691,7 +867,7 @@ class SettingsWindow(QWidget):
     def _build_about_page(self) -> QWidget:
         """Version, file locations and the things that trip people up."""
         page, layout = self._page(
-            "About", "Chiron — an AI gaming assistant that watches your screen."
+            "About", "Chiron: an AI gaming assistant that watches your screen."
         )
 
         form = self._section(layout, "Installation")
@@ -702,7 +878,7 @@ class SettingsWindow(QWidget):
 
         form = self._section(layout, "Known limits")
         for text in (
-            "Run games borderless-windowed — a true-fullscreen X11 game grabs the "
+            "Run games borderless-windowed: a true-fullscreen X11 game grabs the "
             "display and no overlay can draw over it.",
             "Frames arrive at most once a second, so Chiron coaches strategy and "
             "orientation. It cannot call out a dodge in time.",
@@ -725,10 +901,26 @@ class SettingsWindow(QWidget):
         self._loading = True
         try:
             self.api_key_edit.setText(settings.api_key)
-            self.live_model_combo.setCurrentText(settings.live_model)
+            self.openrouter_key_edit.setText(settings.openrouter_api_key)
+            self.model_picker.set_selection(settings.selected_model)
+            self.observer_model_picker.set_selection(settings.observer_model)
+            self.unified_radio.setChecked(settings.agent_mode == "unified")
+            self.split_radio.setChecked(settings.agent_mode == "split")
             self.media_res_combo.setCurrentText(settings.capture.media_resolution)
             self.game_name_edit.setText(settings.game_name)
             self.extra_prompt_edit.setPlainText(settings.extra_system_prompt)
+
+            observer = settings.observer
+            self.gated_radio.setChecked(
+                observer.trigger_strategy == "spike_gated_heartbeat"
+            )
+            self.plain_radio.setChecked(
+                observer.trigger_strategy == "spike_plain_heartbeat"
+            )
+            self.cooldown_spin.setValue(observer.cooldown_seconds)
+            self.heartbeat_spin.setValue(observer.heartbeat_interval_seconds)
+            self.sensitivity_slider.setValue(round(observer.spike_sensitivity * 10))
+            self.observer_frames_spin.setValue(observer.max_frames_per_call)
 
             capture = settings.capture
             self.watch_on_launch_check.setChecked(capture.watch_on_launch)
@@ -779,9 +971,24 @@ class SettingsWindow(QWidget):
         """
         settings = self.settings.copy_deep()
         settings.api_key = self.api_key_edit.text().strip()
-        settings.live_model = self.live_model_combo.currentText().strip()
+        settings.openrouter_api_key = self.openrouter_key_edit.text().strip()
+        settings.selected_model = (
+            self.model_picker.selection() or settings.selected_model
+        )
+        settings.observer_model = self.observer_model_picker.selection()
+        settings.agent_mode = "split" if self.split_radio.isChecked() else "unified"
         settings.game_name = self.game_name_edit.text().strip()
         settings.extra_system_prompt = self.extra_prompt_edit.toPlainText().strip()
+
+        settings.observer.trigger_strategy = (
+            "spike_plain_heartbeat"
+            if self.plain_radio.isChecked()
+            else "spike_gated_heartbeat"
+        )
+        settings.observer.cooldown_seconds = self.cooldown_spin.value()
+        settings.observer.heartbeat_interval_seconds = self.heartbeat_spin.value()
+        settings.observer.spike_sensitivity = self.sensitivity_slider.value() / 10.0
+        settings.observer.max_frames_per_call = self.observer_frames_spin.value()
 
         settings.capture.watch_on_launch = self.watch_on_launch_check.isChecked()
         monitor = self.monitor_combo.currentData()
@@ -848,7 +1055,7 @@ class SettingsWindow(QWidget):
         messages = {
             "xlib": "Using X11 key grabs (python-xlib).",
             "pynput": "Using pynput.",
-            "none": "No global hotkey backend available on this display server — "
+            "none": "No global hotkey backend available on this display server; "
             "the overlay can only be reached from the taskbar.",
         }
         self.hotkey_backend_label.setText(messages.get(backend, backend))
@@ -886,45 +1093,195 @@ class SettingsWindow(QWidget):
         return preview
 
     def _refresh_derived(self) -> None:
-        """Update computed labels: token burn, slider readouts, restart notice."""
+        """Update computed labels, mode-dependent enabling and the restart notice."""
         if not self._ready:
             return
-        resolution = self.media_res_combo.currentText()
-        per_frame = TOKENS_PER_FRAME.get(resolution, 260)
-        baseline = self.baseline_spin.value()
-        burst = self.burst_interval_spin.value()
-        baseline_rate = (60.0 / baseline) * per_frame if baseline else 0.0
-        burst_rate = (60.0 / burst) * per_frame if burst else 0.0
-        minutes = LIVE_CONTEXT_TOKENS / baseline_rate if baseline_rate else 0.0
-        self.burn_label.setText(
-            f"≈{baseline_rate / 1000:.1f}k tokens/min idle, "
-            f"≈{burst_rate / 1000:.1f}k while bursting — about "
-            f"{minutes:.0f} minutes of frames fit in a "
-            f"{LIVE_CONTEXT_TOKENS // 1000}k context before the oldest are evicted."
-        )
+        edited = self.collect()
+        live = is_live_selection(edited.selected_model)
+
+        self._refresh_burn(live, edited)
+        self._refresh_mode_notes(live, edited)
         self.opacity_label.setText(f"{self.opacity_slider.value()}%")
         self.scene_value_label.setText(f"{self.scene_slider.value()}%")
+        self.sensitivity_value_label.setText(
+            f"{self.sensitivity_slider.value() / 10.0:.1f}×"
+        )
 
+        sidecar = self.sidecar_radio.isChecked() and live
         for widget in (
             self.sidecar_model_combo,
             self.sidecar_interval_spin,
             self.sidecar_frames_spin,
         ):
-            widget.setEnabled(self.sidecar_radio.isChecked())
+            widget.setEnabled(sidecar)
 
-        source = self.collect().api_key_source()
+        source = edited.api_key_source()
         messages = {
             "settings": "Using the key saved here.",
-            "none": "No key found — Chiron cannot connect until one is set.",
+            "none": "No key found; Chiron cannot connect until one is set.",
         }
         self.key_source_label.setText(
             messages.get(source, f"Using {source} from the environment.")
         )
 
-        needs_restart = self.settings.requires_session_restart(self.collect())
+        needs_restart = self.settings.requires_session_restart(edited)
+        swap = self.settings.requires_provider_swap(edited)
         self.restart_badge.setText(
-            "Saving will reconnect the live session." if needs_restart else ""
+            "Saving will switch modes and restart the session."
+            if swap
+            else ("Saving will restart the session." if needs_restart else "")
         )
+
+    def _refresh_burn(self, live: bool, edited: Settings) -> None:
+        """The token-burn estimate, which means different things in each mode."""
+        per_frame = TOKENS_PER_FRAME.get(self.media_res_combo.currentText(), 260)
+        baseline = self.baseline_spin.value()
+        burst = self.burst_interval_spin.value()
+        if live:
+            baseline_rate = (60.0 / baseline) * per_frame if baseline else 0.0
+            burst_rate = (60.0 / burst) * per_frame if burst else 0.0
+            minutes = LIVE_CONTEXT_TOKENS / baseline_rate if baseline_rate else 0.0
+            self.burn_label.setText(
+                f"≈{baseline_rate / 1000:.1f}k tokens/min idle, "
+                f"≈{burst_rate / 1000:.1f}k while bursting. About "
+                f"{minutes:.0f} minutes of frames fit in a "
+                f"{LIVE_CONTEXT_TOKENS // 1000}k context before the oldest are "
+                "evicted."
+            )
+            return
+        # Non-live: frames are held, not streamed, so the shutter rate no longer
+        # sets the bill. What does is how often the observer decides to look.
+        observer = edited.observer
+        frames = observer.max_frames_per_call
+        per_call = frames * per_frame + 1500
+        ceiling = (60.0 / observer.cooldown_seconds) * per_call
+        self.burn_label.setText(
+            f"Frames are buffered, not streamed, so this rate costs nothing by "
+            f"itself. Each observer look is ≈{per_call / 1000:.1f}k tokens "
+            f"({frames} frames plus context), capped by the cooldown at "
+            f"≈{ceiling / 1000:.0f}k/min in the worst case, and nothing at all "
+            "while the screen is quiet."
+        )
+
+    def _refresh_mode_notes(self, live: bool, edited: Settings) -> None:
+        """Say which settings the selected model has just made irrelevant."""
+        # The card states provider, mode and prices for anything the catalogue
+        # knows, so the note is left for the one thing it cannot: that this id
+        # was typed in and nothing has vouched for it.
+        known = find_model(self._models, edited.selected_model)
+        self.model_note_label.setText(
+            ""
+            if known or not edited.selected_model
+            else f"{edited.selected_model} is not in any catalogue — it will be "
+            "used exactly as typed."
+        )
+
+        if live:
+            self.detail_note_label.setText(
+                "The API's per-frame token budget: roughly 260 tokens at low, and "
+                "proportionally more above that. Same pixels either way."
+            )
+        else:
+            width = DETAIL_CAPTURE_WIDTH.get(edited.capture.media_resolution, 768)
+            self.detail_note_label.setText(
+                f"Non-live models have no server-side budget, so detail sets the "
+                f"capture width instead: {width} px. Low costs about what live "
+                "low costs."
+            )
+
+        # Frame width is the same dial as frame detail once the mode is non-live.
+        self.encoding_form.setRowVisible(self.frame_width_spin, live)
+        self.encoding_form.setRowVisible(self.frame_width_note_label, not live)
+        self.frame_width_note_label.setText(
+            f"Frame width is set by Frame detail in non-live mode "
+            f"({edited.effective_frame_width()} px)."
+        )
+
+        for widget in (
+            self.unified_radio,
+            self.split_radio,
+            self.observer_model_picker,
+        ):
+            widget.setEnabled(not live)
+        self.observer_model_picker.setEnabled(not live and self.split_radio.isChecked())
+        self.agent_note_label.setText(
+            "Live models observe as they watch; this applies to non-live models only."
+            if live
+            else "Leave blank to observe with the model chosen above."
+        )
+
+        for widget in (
+            self.gated_radio,
+            self.plain_radio,
+            self.cooldown_spin,
+            self.heartbeat_spin,
+            self.sensitivity_slider,
+            self.observer_frames_spin,
+        ):
+            widget.setEnabled(not live)
+        self.observer_mode_label.setText(
+            "A live model is selected, so there is no observer: the session "
+            "watches continuously and journals from within. These settings apply "
+            "when a non-live model is chosen."
+            if live
+            else f"Observing with {edited.observer_model_id()}."
+        )
+
+    # ------------------------------------------------------------- catalogue
+
+    def refresh_catalogue(self, *, force: bool = False) -> None:
+        """Fetch the model lists for whichever providers have a key.
+
+        Fetching is blocking HTTP, so it happens on a thread and the form is
+        populated when it lands. Everything works before it does: the picker
+        already holds the saved selection, and a failed fetch falls back to a
+        cache and then to a small static list rather than to an empty dropdown.
+        """
+        edited = self.collect()
+        google_key = edited.resolved_api_key()
+        openrouter_key = edited.resolved_openrouter_key()
+
+        async def fetch() -> None:
+            self.refresh_models_button.setEnabled(False)
+            try:
+                models = await asyncio.to_thread(
+                    available_models,
+                    google_key=google_key,
+                    openrouter_key=openrouter_key,
+                    force=force,
+                )
+            except Exception as error:  # noqa: BLE001 — offline is normal here
+                logger.warning("Could not list models: %s", error)
+                models = []
+            finally:
+                self.refresh_models_button.setEnabled(True)
+            if models:
+                self.set_models(models)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop (a bare widget test). The static list stands.
+            logger.debug("No event loop; skipping catalogue fetch")
+            return
+        asyncio.ensure_future(fetch())
+
+    def set_models(self, models: list[Any]) -> None:
+        """Offer `models` in both pickers, the observer's filtered to non-live.
+
+        Args:
+            models (list[ModelInfo]): Catalogue entries to offer.
+        """
+        self._models = list(models)
+        loading, self._loading = self._loading, True
+        try:
+            self.model_picker.set_models(self._models)
+            self.observer_model_picker.set_models(
+                [m for m in self._models if not m.is_live]
+            )
+        finally:
+            self._loading = loading
+        self._refresh_derived()
 
     def _test_api_key(self) -> None:
         """Check the credential by listing models, without leaving the window."""
@@ -955,4 +1312,4 @@ class SettingsWindow(QWidget):
             self.check_key_button.setEnabled(True)
 
 
-__all__ = ["TOKENS_PER_FRAME", "HotkeyEdit", "SettingsWindow"]
+__all__ = ["TOKENS_PER_FRAME", "HotkeyEdit", "ModelPicker", "SettingsWindow"]

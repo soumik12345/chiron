@@ -11,11 +11,18 @@ The flow through the app is small enough to state in full:
   to the journal writer;
 * the player's question bursts the shutter and is sent as text;
 * the model's answer streams back into the overlay;
-* notable events become journal entries — by the model calling ``record_event``
-  or by the sidecar summariser, depending on the setting;
+* notable events become journal entries — by the model calling ``record_event``,
+  by the sidecar summariser, or by the non-live observer, depending on the mode
+  and the setting;
 * every couple of minutes the new journal lines are folded back into the session,
   so they outlive the frames that produced them;
 * when the session dies, it is reopened and re-seeded from the journal.
+
+Which *kind* of session that is depends entirely on the selected model, and this
+object is where the choice is made concrete: :func:`~chiron.session.build_session_provider`
+returns a live or a non-live manager, and everything else here is written against
+the surface they share. Switching models across that boundary tears one down and
+builds the other — the same path as a session restart, one step longer.
 
 Saving settings goes through here too, because only this object knows which
 changes can be applied in place and which need the session rotated.
@@ -49,7 +56,7 @@ from chiron.config.settings import (
 )
 from chiron.journal.log import JournalEntry, JournalLog
 from chiron.journal.writers import JournalWriter, build_journal_writer
-from chiron.live.session import LiveSessionManager
+from chiron.session import SessionProvider, build_session_provider
 from chiron.ui.hotkeys import GlobalHotkeyManager
 from chiron.ui.overlay import OverlayWindow
 from chiron.ui.settings_window import SettingsWindow
@@ -68,7 +75,8 @@ class ChironApp(QObject):
         settings_path (Path): Where settings are persisted.
         journal (JournalLog): The shared journal.
         writer (JournalWriter): The active journal strategy.
-        session (LiveSessionManager): The Live API connection.
+        session (SessionProvider): The live or non-live session, whichever the
+            selected model implies.
         capture (CaptureService): The screen capture thread.
         overlay (OverlayWindow): The floating chat panel.
     """
@@ -88,8 +96,10 @@ class ChironApp(QObject):
 
         self.journal = JournalLog(max_entries=settings.journal.max_entries)
         self.writer: JournalWriter = self._build_writer()
-        self.session = LiveSessionManager(settings, self.journal, self.writer, self)
-        self.capture = CaptureService(settings.capture, self)
+        self.session: SessionProvider = build_session_provider(
+            settings, self.journal, self.writer, self
+        )
+        self.capture = CaptureService(settings.effective_capture(), self)
         self.overlay = OverlayWindow(settings.overlay)
         self.settings_window: SettingsWindow | None = None
         self.hotkeys = GlobalHotkeyManager(self)
@@ -108,16 +118,21 @@ class ChironApp(QObject):
     # --------------------------------------------------------------- wiring
 
     def _build_writer(self) -> JournalWriter:
-        """Create the journal writer named by the current settings."""
+        """Create the journal writer the current mode and settings call for."""
         return build_journal_writer(
             self.settings.journal,
             self.journal,
             api_key=self.settings.resolved_api_key(),
             on_entry=self._on_journal_entry,
+            live=self.settings.is_live,
         )
 
     def _connect(self) -> None:
-        """Connect every signal to its handler."""
+        """Connect every signal to its handler.
+
+        Both session providers emit the same five signals, so this method has no
+        idea which one it is wiring — and neither does the overlay.
+        """
         self.overlay.promptSubmitted.connect(self._on_prompt)
         self.overlay.settingsRequested.connect(self.show_settings)
         self.overlay.panelHidden.connect(self._remember_geometry)
@@ -128,11 +143,7 @@ class ChironApp(QObject):
         self.capture.sceneChanged.connect(self._on_scene_change)
         self.capture.errorOccurred.connect(self._on_capture_error)
 
-        self.session.statusChanged.connect(self.overlay.set_status)
-        self.session.responseStarted.connect(self.overlay.start_response)
-        self.session.responseDelta.connect(self.overlay.append_delta)
-        self.session.responseCompleted.connect(self.overlay.end_response)
-        self.session.errorOccurred.connect(self._on_session_error)
+        self._connect_session()
 
         self.window_tracker.windowChanged.connect(self._on_active_window)
 
@@ -140,6 +151,19 @@ class ChironApp(QObject):
         self.hotkeys.failed.connect(
             lambda message: self.overlay.append_system(f"⚠ {message}")
         )
+
+    def _connect_session(self) -> None:
+        """Wire the current session provider's signals to the overlay.
+
+        Separate from :meth:`_connect` because the provider is replaced whenever
+        the selected model crosses the live/non-live boundary, and a new object
+        arrives with none of the old one's connections.
+        """
+        self.session.statusChanged.connect(self.overlay.set_status)
+        self.session.responseStarted.connect(self.overlay.start_response)
+        self.session.responseDelta.connect(self.overlay.append_delta)
+        self.session.responseCompleted.connect(self.overlay.end_response)
+        self.session.errorOccurred.connect(self._on_session_error)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -169,9 +193,9 @@ class ChironApp(QObject):
         self.fold_timer.start()
         self.footer_timer.start()
 
-        if not self.settings.resolved_api_key():
+        if not self.settings.key_for_model(self.settings.selected_model):
             self.overlay.append_system(
-                "No Gemini API key configured — open Settings (⚙) to add one."
+                "No API key for the selected model. Open Settings (⚙) to add one."
             )
         if self.settings.capture.watch_on_launch:
             self.set_watching(True)
@@ -241,6 +265,11 @@ class ChironApp(QObject):
             # A fresh look before anything else: while `self.watching` is still
             # False this cannot double-journal through _on_active_window.
             self.window_tracker.poll()
+            # The screen moved on while nobody was looking, so whatever the
+            # session last saw is not a baseline to compare the next frame
+            # against. The capture service resets its own; this resets the
+            # non-live observer's novelty detector.
+            self.session.reset_observation()
 
         self.capture.set_watching(watching)
         self.overlay.set_watching(watching, self.settings.hotkeys.toggle_watching)
@@ -254,7 +283,7 @@ class ChironApp(QObject):
                     source="system",
                 )
                 self.overlay.append_system(
-                    f"● Watching your screen — looks like {info.label}."
+                    f"● Watching your screen. Looks like {info.label}."
                 )
             else:
                 self.overlay.append_system("● Watching your screen.")
@@ -287,8 +316,8 @@ class ChironApp(QObject):
         elif not self._warned_not_watching:
             self._warned_not_watching = True
             self.overlay.append_system(
-                f"Chiron is not watching, so it cannot see your screen right now "
-                f"— press {self._watch_hotkey_hint()} to let it look."
+                f"Chiron is not watching, so it cannot see your screen right now. "
+                f"Press {self._watch_hotkey_hint()} to let it look."
             )
         if self.session.status in ("idle", "stopped"):
             self.session.start()
@@ -357,9 +386,13 @@ class ChironApp(QObject):
             mode = self.capture.scheduler.mode(time.time())
             reason = self.capture.scheduler.burst_reason
             shutter = f"{mode} ({reason})" if reason else mode
+        # Observer runs only exist in non-live mode, and there they are the
+        # number that actually explains the bill.
+        observed = getattr(self.session, "observer_runs", None)
+        looks = f"  ·  looks: {observed}" if observed is not None else ""
         self.overlay.set_footer(
             f"shutter: {shutter}  ·  frames sent: {self.session.frames_sent}"
-            f"  ·  journal: {len(self.journal)}"
+            f"{looks}  ·  journal: {len(self.journal)}"
         )
 
     # -------------------------------------------------------------- settings
@@ -375,6 +408,10 @@ class ChironApp(QObject):
         current = self.window_tracker.current
         self.settings_window.set_detected_game(current.label if current else "")
         self.settings_window.load(self.settings)
+        # Which providers exist depends on which keys are set, so the model list
+        # is only knowable once the current settings are in hand — here, not at
+        # build time. It arrives asynchronously; the form works meanwhile.
+        self.settings_window.refresh_catalogue()
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
@@ -397,7 +434,7 @@ class ChironApp(QObject):
         except OSError as error:
             self.overlay.append_system(f"⚠ Could not save settings: {error}")
 
-        self.capture.apply_settings(new_settings.capture)
+        self.capture.apply_settings(new_settings.effective_capture())
         self.overlay.apply_settings(new_settings.overlay)
         self.journal.max_entries = new_settings.journal.max_entries
         self.fold_timer.setInterval(
@@ -407,27 +444,55 @@ class ChironApp(QObject):
         self.overlay.set_watching(self.watching, new_settings.hotkeys.toggle_watching)
         self.overlay.set_hide_hint(new_settings.hotkeys.toggle_overlay)
         self.session.apply_settings(new_settings)
+        if previous.effective_frame_width() != new_settings.effective_frame_width():
+            # New thumbnail statistics; what the detector learned no longer
+            # describes the frames it is about to be given.
+            self.session.reset_observation()
 
-        strategy_changed = previous.journal.strategy != new_settings.journal.strategy
-        if previous.requires_session_restart(new_settings) or strategy_changed:
-            asyncio.ensure_future(self._restart_session(strategy_changed))
+        swap = previous.requires_provider_swap(new_settings)
+        strategy_changed = (
+            swap or previous.journal.strategy != new_settings.journal.strategy
+        )
+        if swap or previous.requires_session_restart(new_settings):
+            asyncio.ensure_future(self._restart_session(strategy_changed, swap))
         self.overlay.append_system("Settings saved.")
 
-    async def _restart_session(self, rebuild_writer: bool) -> None:
-        """Reconnect with the new configuration, keeping the journal.
+    async def _restart_session(
+        self, rebuild_writer: bool, swap_provider: bool = False
+    ) -> None:
+        """Restart with the new configuration, keeping the journal.
 
         Args:
-            rebuild_writer (bool): True when the journal strategy changed, which
-                means the old writer has to be stopped and replaced.
+            rebuild_writer (bool): True when the journal strategy changed — or
+                when the mode did, since the two modes journal differently —
+                which means the old writer has to be stopped and replaced.
+            swap_provider (bool): True when the selection crossed the
+                live/non-live boundary, so the session object itself is
+                replaced rather than reopened.
         """
         await self.session.stop()
         if rebuild_writer:
             await self.writer.stop()
             self.writer = self._build_writer()
+        if swap_provider:
+            detected = self.session.detected_game
+            self.session = build_session_provider(
+                self.settings, self.journal, self.writer, self
+            )
+            # Runtime state, not a setting, so nothing reloads it — but the game
+            # is still the game, and re-detecting it would need another window
+            # switch to happen first.
+            self.session.detected_game = detected
+            self._connect_session()
+            self.overlay.append_system(
+                "Live mode." if self.settings.is_live else "Non-live mode."
+            )
+        elif rebuild_writer:
             self.session.writer = self.writer
-        # Reconnect only if the screen is still being watched. Editing settings
+        # Restart only if the screen is still being watched. Editing settings
         # must never be a back door into watching.
         if self.watching:
+            self.session.reset_observation()
             self.session.start()
 
     def _remember_geometry(self) -> None:
@@ -467,7 +532,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fresh-install",
         action="store_true",
         help=(
-            "Delete Chiron's saved configuration — including any saved API key — "
+            "Delete Chiron's saved configuration, including any saved API key, "
             "and exit, so the next run starts as if newly installed. Asks first."
         ),
     )
@@ -509,7 +574,7 @@ def fresh_install(
     plan = plan_removal(settings_path)
 
     if plan.is_empty:
-        print(f"Nothing to remove — no configuration at {settings_path}.", file=out)
+        print(f"Nothing to remove: no configuration at {settings_path}.", file=out)
         return 0
 
     print("This will:", file=out)

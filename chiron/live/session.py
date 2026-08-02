@@ -241,6 +241,15 @@ class LiveSessionManager(QObject):
         if task is not None and not task.done():
             task.cancel()
 
+    def reset_observation(self) -> None:
+        """Nothing to reset: the Live API decides for itself what it has seen.
+
+        Part of the :class:`~chiron.session.SessionProvider` surface, where the
+        non-live provider uses it to restart its novelty detector's warm-up. A
+        live session has no such state — the model watches continuously, and the
+        capture service's own scene-change baseline is reset separately.
+        """
+
     def apply_settings(self, settings: Settings) -> None:
         """Adopt new settings for subsequent connections.
 
@@ -276,6 +285,9 @@ class LiveSessionManager(QObject):
         resolution = MEDIA_RESOLUTIONS.get(
             self.settings.capture.media_resolution, "MEDIA_RESOLUTION_LOW"
         )
+        # `settings.live_model` is derived from the provider-qualified selection,
+        # so a non-live selection reaching here (it should not) still connects
+        # with a real Live model id rather than a 404.
         return types.LiveConnectConfig(
             # Every Live model still served is a native-audio one, and those
             # accept only the AUDIO response modality — asking for TEXT is
@@ -311,7 +323,7 @@ class LiveSessionManager(QObject):
         while not self._stopping:
             api_key = self.settings.resolved_api_key()
             if not api_key:
-                self._set_status("error", "No Gemini API key — open Settings")
+                self._set_status("error", "No Gemini API key. Open Settings")
                 self.errorOccurred.emit(
                     "No Gemini API key configured. Open Settings and paste one, "
                     "or export GEMINI_API_KEY."

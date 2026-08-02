@@ -385,7 +385,7 @@ class OverlayWindow(QWidget):
         if watching:
             self.watch_button.setText("👁 Watching")
             self.watch_button.setToolTip(
-                f"Chiron is reading your screen — stop{suffix}"
+                f"Chiron is reading your screen. Stop watching{suffix}"
             )
             self.watch_button.setStyleSheet(f"color: {PALETTE['live']};")
         else:
@@ -393,7 +393,7 @@ class OverlayWindow(QWidget):
             # previously has zero width and draws itself over the next letter.
             self.watch_button.setText("⊘ Not watching")
             self.watch_button.setToolTip(
-                f"Chiron cannot see your screen — start watching{suffix}"
+                f"Chiron cannot see your screen. Start watching{suffix}"
             )
             self.watch_button.setStyleSheet(f"color: {PALETTE['text_faint']};")
 

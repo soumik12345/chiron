@@ -242,7 +242,7 @@ def describe_monitors() -> list[str]:
             for index, monitor in enumerate(sct.monitors):
                 scope = "All monitors" if index == 0 else f"Monitor {index}"
                 labels.append(
-                    f"{scope} — {monitor['width']}x{monitor['height']} "
+                    f"{scope}: {monitor['width']}x{monitor['height']} "
                     f"at ({monitor['left']}, {monitor['top']})"
                 )
             return labels

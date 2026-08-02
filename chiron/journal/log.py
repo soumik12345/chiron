@@ -63,7 +63,7 @@ class JournalEntry:
 
     def render(self) -> str:
         """The entry as one journal line."""
-        return f"{self.clock} — [{self.category}] {self.note}"
+        return f"{self.clock} [{self.category}] {self.note}"
 
 
 @dataclass
