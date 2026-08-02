@@ -68,7 +68,7 @@ GAME JOURNAL (facts recorded earlier; the frames they came from are gone):
 
 
 def build_system_instruction(
-    settings: Settings, *, journal_enabled: bool = True
+    settings: Settings, *, journal_enabled: bool = True, detected_game: str = ""
 ) -> str:
     """Assemble the system instruction for a session.
 
@@ -77,14 +77,25 @@ def build_system_instruction(
             any user additions.
         journal_enabled (bool): Whether the tool-call journal is in force, which
             decides if the ``record_event`` guidance is included.
+        detected_game (str): The focused window when watching started, phrased
+            by :meth:`~chiron.capture.active_window.WindowInfo.describe`. Used
+            only when the player has not named the game themselves, and hedged
+            because a focused window is evidence, not certainty.
 
     Returns:
         str: The full system instruction.
     """
     parts = [BASE_SYSTEM_PROMPT]
     game = settings.game_name.strip()
+    detected = detected_game.strip()
     if game:
         parts.append(f"\nThe player is playing: {game}.\n")
+    elif detected:
+        parts.append(
+            f"\nThe player appears to be playing: {detected} — detected from "
+            "the window in focus when watching started. Trust the frames if "
+            "they show something else.\n"
+        )
     if journal_enabled:
         parts.append(JOURNAL_TOOL_PROMPT)
     extra = settings.extra_system_prompt.strip()

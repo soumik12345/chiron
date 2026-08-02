@@ -36,6 +36,7 @@ import qasync
 from PySide6.QtCore import QObject, QTimer
 from PySide6.QtWidgets import QApplication
 
+from chiron.capture.active_window import ActiveWindowTracker, WindowInfo
 from chiron.capture.frames import Frame
 from chiron.capture.service import CaptureService
 from chiron.config.settings import (
@@ -92,6 +93,7 @@ class ChironApp(QObject):
         self.overlay = OverlayWindow(settings.overlay)
         self.settings_window: SettingsWindow | None = None
         self.hotkeys = GlobalHotkeyManager(self)
+        self.window_tracker = ActiveWindowTracker(self._chiron_window_ids, self)
 
         self.fold_timer = QTimer(self)
         self.fold_timer.setInterval(int(settings.journal.fold_interval_seconds * 1000))
@@ -132,6 +134,8 @@ class ChironApp(QObject):
         self.session.responseCompleted.connect(self.overlay.end_response)
         self.session.errorOccurred.connect(self._on_session_error)
 
+        self.window_tracker.windowChanged.connect(self._on_active_window)
+
         self.hotkeys.activated.connect(self._on_hotkey)
         self.hotkeys.failed.connect(
             lambda message: self.overlay.append_system(f"⚠ {message}")
@@ -160,6 +164,7 @@ class ChironApp(QObject):
 
         self.hotkeys.set_bindings(self._hotkey_bindings())
         self.hotkeys.start()
+        self.window_tracker.start()
         self.capture.start()
         self.fold_timer.start()
         self.footer_timer.start()
@@ -197,6 +202,7 @@ class ChironApp(QObject):
         self.fold_timer.stop()
         self.footer_timer.stop()
         self.hotkeys.stop()
+        self.window_tracker.stop()
         self.capture.stop()
         self._remember_geometry()
         try:
@@ -231,11 +237,27 @@ class ChironApp(QObject):
         if watching == self.watching:
             return
 
+        if watching:
+            # A fresh look before anything else: while `self.watching` is still
+            # False this cannot double-journal through _on_active_window.
+            self.window_tracker.poll()
+
         self.capture.set_watching(watching)
         self.overlay.set_watching(watching, self.settings.hotkeys.toggle_watching)
 
         if watching:
-            self.overlay.append_system("● Watching your screen.")
+            info = self.window_tracker.current
+            if info is not None and not self.settings.game_name.strip():
+                self.session.detected_game = info.describe()
+                self.journal.append(
+                    f"Watching started; the player is in {info.describe()}.",
+                    source="system",
+                )
+                self.overlay.append_system(
+                    f"● Watching your screen — looks like {info.label}."
+                )
+            else:
+                self.overlay.append_system("● Watching your screen.")
             if self.session.status in ("idle", "stopped", "error"):
                 self.session.start()
         else:
@@ -292,6 +314,28 @@ class ChironApp(QObject):
         """Show a new journal entry inline in the transcript."""
         self.overlay.append_journal(entry)
 
+    def _chiron_window_ids(self) -> set[int]:
+        """Chiron's own window ids, which can never be "the player's window"."""
+        ids = {int(self.overlay.winId())}
+        if self.settings_window is not None:
+            ids.add(int(self.settings_window.winId()))
+        return ids
+
+    def _on_active_window(self, info: WindowInfo) -> None:
+        """Note that the player moved to a different application.
+
+        The session's ``detected_game`` is kept current so the next connection's
+        instruction names the right game, and while watching, the switch is
+        journaled — the running session's instruction is fixed, so the fold is
+        how it learns mid-session.
+        """
+        if not self.settings.game_name.strip():
+            self.session.detected_game = info.describe()
+        if self.watching:
+            self.journal.append(
+                f"The player switched to {info.describe()}.", source="system"
+            )
+
     def _on_hotkey(self, name: str) -> None:
         """Act on a global hotkey."""
         if name == "toggle_overlay":
@@ -328,6 +372,8 @@ class ChironApp(QObject):
             self.settings_window.appearanceChanged.connect(self.overlay.apply_settings)
             self.settings_window.quitRequested.connect(self.request_quit)
         self.settings_window.set_hotkey_backend(self.hotkeys.backend_name)
+        current = self.window_tracker.current
+        self.settings_window.set_detected_game(current.label if current else "")
         self.settings_window.load(self.settings)
         self.settings_window.show()
         self.settings_window.raise_()

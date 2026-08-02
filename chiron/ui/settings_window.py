@@ -355,7 +355,10 @@ class SettingsWindow(QWidget):
         self.game_name_edit.setPlaceholderText("e.g. Elden Ring")
         form.addRow("Game", self.game_name_edit)
         self._hint(
-            form, "Told to the model up front, so it knows what it is looking at."
+            form,
+            "Told to the model up front, so it knows what it is looking at. "
+            "Leave empty and Chiron works it out from the window you are in "
+            "when watching starts.",
         )
 
         self.extra_prompt_edit = self._register(
@@ -825,6 +828,20 @@ class SettingsWindow(QWidget):
         self.settings = settings.copy_deep()
         self.settingsSaved.emit(settings)
         self._refresh_derived()
+
+    def set_detected_game(self, name: str) -> None:
+        """Show the auto-detected game as the Game field's placeholder.
+
+        A placeholder, not a value: the field stays empty so Save never turns a
+        guess into the player's explicit choice.
+
+        Args:
+            name (str): The detected game, or empty to restore the example.
+        """
+        if name:
+            self.game_name_edit.setPlaceholderText(f"auto-detected: {name}")
+        else:
+            self.game_name_edit.setPlaceholderText("e.g. Elden Ring")
 
     def set_hotkey_backend(self, backend: str) -> None:
         """Report which hotkey mechanism is active, for the hotkeys page."""

@@ -123,6 +123,10 @@ class LiveSessionManager(QObject):
         self.journal = journal
         self.writer = writer
         self.status = "idle"
+        #: The focused window when watching started, already phrased for the
+        #: instruction. Runtime state, not a setting: it is discovered, changes
+        #: per play session, and must never be persisted as the player's choice.
+        self.detected_game = ""
 
         self._task: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -282,7 +286,9 @@ class LiveSessionManager(QObject):
             response_modalities=[types.Modality.AUDIO],
             output_audio_transcription=types.AudioTranscriptionConfig(),
             system_instruction=build_system_instruction(
-                self.settings, journal_enabled=bool(declarations)
+                self.settings,
+                journal_enabled=bool(declarations),
+                detected_game=self.detected_game,
             ),
             media_resolution=getattr(types.MediaResolution, resolution),
             # Unbounded session duration, at the price of old frames being
