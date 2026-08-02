@@ -389,7 +389,9 @@ class OverlayWindow(QWidget):
             )
             self.watch_button.setStyleSheet(f"color: {PALETTE['live']};")
         else:
-            self.watch_button.setText("⃠ Not watching")
+            # U+2298 (⊘) is a standalone glyph; the combining U+20E0 used here
+            # previously has zero width and draws itself over the next letter.
+            self.watch_button.setText("⊘ Not watching")
             self.watch_button.setToolTip(
                 f"Chiron cannot see your screen — start watching{suffix}"
             )
