@@ -179,3 +179,68 @@ async def test_stopping_is_recorded_in_the_transcript(app):
     transcript = app.overlay.transcript.toPlainText()
     assert "Watching your screen." in transcript
     assert "Stopped watching" in transcript
+
+
+def test_starting_to_watch_resets_what_the_session_thinks_it_has_seen(app):
+    """The screen moved on during the pause; the first frame back is not news."""
+    app.set_watching(True)
+    assert app.session.resets == 1
+
+
+# ---------------------------------------------------------------- mode swap
+
+
+async def test_choosing_a_non_live_model_swaps_the_provider(app):
+    from chiron.journal.writers import ObserverJournal, ToolCallJournal
+    from chiron.nonlive.session import NonLiveSessionManager
+
+    _real_session(app)
+    assert isinstance(app.writer, ToolCallJournal)
+
+    edited = app.settings.copy_deep()
+    edited.selected_model = "gemini/gemini-2.5-flash"
+    app.apply_settings(edited)
+    await settle()
+    await settle()
+
+    assert isinstance(app.session, NonLiveSessionManager)
+    assert isinstance(app.writer, ObserverJournal), (
+        "the two modes journal differently, so the writer goes with the provider"
+    )
+    assert "Non-live mode." in app.overlay.transcript.toPlainText()
+
+
+async def test_the_detected_game_survives_a_mode_swap(app):
+    app.session = _real_session(app)
+    app.session.detected_game = "Hollow Knight"
+
+    edited = app.settings.copy_deep()
+    edited.selected_model = "gemini/gemini-2.5-flash"
+    app.apply_settings(edited)
+    await settle()
+    await settle()
+
+    assert app.session.detected_game == "Hollow Knight"
+
+
+async def test_non_live_capture_width_follows_frame_detail(app):
+    edited = app.settings.copy_deep()
+    edited.selected_model = "gemini/gemini-2.5-flash"
+    edited.capture.frame_width = 1920
+    edited.capture.media_resolution = "low"
+
+    app.apply_settings(edited)
+    await settle()
+
+    assert app.capture.settings.frame_width == 512
+    assert app.settings.capture.frame_width == 1920, "the stored value is untouched"
+
+
+def _real_session(app):
+    """Replace the spy with the production provider the settings imply."""
+    from chiron.session import build_session_provider
+
+    session = build_session_provider(app.settings, app.journal, app.writer, app)
+    app.session = session
+    app._connect_session()
+    return session

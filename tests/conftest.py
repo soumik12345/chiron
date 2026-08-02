@@ -23,7 +23,7 @@ def qapp():
 
 
 class SessionSpy:
-    """Stands in for the live session, so no socket is ever opened."""
+    """Stands in for a session provider, so no socket and no model is reached."""
 
     frames_sent = 0
 
@@ -31,6 +31,8 @@ class SessionSpy:
         self.status = "idle"
         self.starts = 0
         self.stops = 0
+        self.resets = 0
+        self.detected_game = ""
         self.texts: list[str] = []
 
     def start(self) -> None:
@@ -49,6 +51,9 @@ class SessionSpy:
     def fold_journal(self, *, force: bool = False) -> int:
         return 0
 
+    def reset_observation(self) -> None:
+        self.resets += 1
+
     def apply_settings(self, settings) -> None: ...
 
 
@@ -58,8 +63,8 @@ def app(qapp, tmp_path, monkeypatch):
     from chiron.app import ChironApp
     from chiron.config.settings import Settings
 
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
     instance = ChironApp(Settings(), tmp_path / "settings.json")
     instance.session = SessionSpy()
     return instance

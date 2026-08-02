@@ -280,7 +280,7 @@ def test_watching_registers_the_detected_game(app):
 
     assert app.session.detected_game == "Manor Lords (Steam)"
     assert "Manor Lords" in app.journal.render()
-    assert "looks like Manor Lords" in app.overlay.transcript.toPlainText()
+    assert "Looks like Manor Lords" in app.overlay.transcript.toPlainText()
 
 
 def test_a_manually_named_game_silences_detection(app):
