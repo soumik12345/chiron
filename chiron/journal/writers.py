@@ -239,6 +239,7 @@ class SidecarJournal(JournalWriter):
         api_key: str = "",
         on_entry: EntryCallback | None = None,
         model: LiteLLMModel | None = None,
+        usage_sink: Callable[[Any], None] | None = None,
     ) -> None:
         """Create a stopped sidecar.
 
@@ -249,6 +250,10 @@ class SidecarJournal(JournalWriter):
                 leaves litellm to find one in the environment.
             on_entry (EntryCallback | None): Per-entry UI callback.
             model (LiteLLMModel | None): Override the summariser, for tests.
+            usage_sink (Callable | None): Where this writer's priced calls go.
+                The sidecar is the one part of live mode that *does* reach
+                litellm, so its spend is measured rather than estimated — and
+                without a sink it would be the one real number nobody records.
         """
         super().__init__(log, on_entry)
         self.settings = settings
@@ -257,6 +262,7 @@ class SidecarJournal(JournalWriter):
             api_key=api_key or None,
             temperature=0.2,
             max_tokens=800,
+            usage_sink=usage_sink,
         )
         self._transcript: deque[tuple[float, str, str]] = deque(maxlen=40)
         self._frames: deque[Frame] = deque(maxlen=max(1, settings.sidecar_frame_count))
@@ -441,6 +447,7 @@ def build_journal_writer(
     api_key: str = "",
     on_entry: EntryCallback | None = None,
     live: bool = True,
+    usage_sink: Callable[[Any], None] | None = None,
 ) -> JournalWriter:
     """Create the writer the current mode and strategy call for.
 
@@ -453,6 +460,8 @@ def build_journal_writer(
             setting only means something there; a non-live provider always
             journals through its observer, so the setting is ignored rather
             than being allowed to install a sidecar that would duplicate it.
+        usage_sink (Callable | None): Where the sidecar's priced calls go. The
+            other two strategies make no calls of their own and ignore it.
 
     Returns:
         JournalWriter: An :class:`ObserverJournal`, :class:`SidecarJournal` or
@@ -461,7 +470,9 @@ def build_journal_writer(
     if not live:
         return ObserverJournal(log, on_entry)
     if settings.strategy == "sidecar":
-        return SidecarJournal(log, settings, api_key=api_key, on_entry=on_entry)
+        return SidecarJournal(
+            log, settings, api_key=api_key, on_entry=on_entry, usage_sink=usage_sink
+        )
     return ToolCallJournal(log, on_entry)
 
 

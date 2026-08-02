@@ -32,7 +32,9 @@ class SessionSpy:
         self.starts = 0
         self.stops = 0
         self.resets = 0
+        self.memory_resets = 0
         self.detected_game = ""
+        self.session_id = ""
         self.texts: list[str] = []
 
     def start(self) -> None:
@@ -54,17 +56,27 @@ class SessionSpy:
     def reset_observation(self) -> None:
         self.resets += 1
 
+    def reset_memory(self) -> None:
+        self.memory_resets += 1
+
     def apply_settings(self, settings) -> None: ...
 
 
 @pytest.fixture
 def app(qapp, tmp_path, monkeypatch):
-    """A fully wired `ChironApp`, not started, with a stubbed live session."""
+    """A fully wired `ChironApp`, not started, with a stubbed live session.
+
+    Sessions are recorded under `tmp_path`, never the real data directory: a
+    test suite that writes into the user's play history would be a worse bug
+    than anything it could catch.
+    """
     from chiron.app import ChironApp
     from chiron.config.settings import Settings
 
     for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(name, raising=False)
-    instance = ChironApp(Settings(), tmp_path / "settings.json")
+    instance = ChironApp(
+        Settings(), tmp_path / "settings.json", sessions_root=tmp_path / "sessions"
+    )
     instance.session = SessionSpy()
     return instance

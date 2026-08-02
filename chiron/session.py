@@ -45,15 +45,28 @@ from chiron.journal.writers import JournalWriter
 class SessionProvider(Protocol):
     """What :class:`~chiron.app.ChironApp` requires of a session.
 
+    Both implementations emit the same nine signals. Five are the conversation
+    (``statusChanged``, ``responseStarted``, ``responseDelta``,
+    ``responseCompleted``, ``errorOccurred``) and are what the overlay renders.
+    Four are the record (``frameSent``, ``observerRan``, ``llmCall``,
+    ``compacted``) and are what :class:`~chiron.sessions.recorder.SessionRecorder`
+    writes down. A provider with nothing to say on one of them simply never
+    emits it — live mode has no observer, non-live mode has no journal fold —
+    which keeps the seam one shape rather than two.
+
     Attributes:
         status (str): Current status, from the shared vocabulary.
         detected_game (str): The focused window, phrased for the instruction.
             Runtime state, deliberately not a setting.
+        session_id (str): The gameplay session calls are billed to. Runtime
+            state, for the same reason, and carried across a provider swap by
+            hand exactly as ``detected_game`` is.
         frames_sent (int): Frames handed to the model so far.
     """
 
     status: str
     detected_game: str
+    session_id: str
 
     @property
     def frames_sent(self) -> int:
@@ -76,6 +89,15 @@ class SessionProvider(Protocol):
 
     def reset_observation(self) -> None:
         """Forget what the screen looked like before now."""
+
+    def reset_memory(self) -> None:
+        """Forget the conversation entirely — a new gameplay session started.
+
+        Stronger than :meth:`reset_observation`, which only forgets what the
+        screen looked like. This is the model's own memory: the non-live
+        history, or the live session's server-side context, which can only be
+        cleared by reconnecting without the handle that would restore it.
+        """
 
     def apply_settings(self, settings: Settings) -> None:
         """Adopt new settings for subsequent requests."""

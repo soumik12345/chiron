@@ -492,6 +492,34 @@ def available_models(
     return models
 
 
+def cached_context_length(model_id: str) -> int | None:
+    """The model's context window from the disk caches only — never the network.
+
+    Compaction asks this before every question, so it must be cheap and offline:
+    a blocking HTTP request on the path between a player pressing Enter and an
+    answer starting is not a trade any context accounting is worth. A cold cache
+    simply answers None and the caller falls back to litellm's bundled map.
+
+    Args:
+        model_id (str): The litellm id to look up.
+
+    Returns:
+        int | None: The window in tokens, or None when no cache knows it.
+    """
+    target = (model_id or "").strip()
+    if not target:
+        return None
+    forever = 2**31
+    for cache_path in (_GOOGLE_CACHE, _OPENROUTER_CACHE):
+        for model in _read_cache(cache_path, ttl=forever) or []:
+            if model.id == target and model.context_length:
+                return int(model.context_length)
+    for model in STATIC_MODELS:
+        if model.id == target and model.context_length:
+            return int(model.context_length)
+    return None
+
+
 def find_model(models: list[ModelInfo], model_id: str) -> ModelInfo | None:
     """The entry for `model_id`, or None when the catalogue has never heard of it."""
     target = (model_id or "").strip()
@@ -525,6 +553,7 @@ __all__ = [
     "STATIC_MODELS",
     "ModelInfo",
     "available_models",
+    "cached_context_length",
     "describe_unknown",
     "find_model",
     "list_google_models",

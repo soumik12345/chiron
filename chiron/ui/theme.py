@@ -82,6 +82,35 @@ def overlay_stylesheet(font_size: int = 11) -> str:
         border: none;
         selection-background-color: {p["accent_dim"]};
     }}
+    /* The session title is a button that must not read as one: it is a label
+       you can click, and a button-shaped control here would compete with the
+       three in the header that actually change what Chiron is doing. */
+    QToolButton#sessionTitle {{
+        color: {p["text_dim"]};
+        font-size: {max(7, font_size - 2)}pt;
+        text-align: left;
+        padding: 1px 4px;
+    }}
+    QToolButton#sessionTitle:disabled {{
+        color: {p["text_faint"]};
+    }}
+    QListWidget#sessions {{
+        background-color: transparent;
+        border: none;
+        outline: none;
+    }}
+    QListWidget#sessions::item {{
+        padding: 7px 6px;
+        border-bottom: 1px solid {p["border"]};
+        color: {p["text"]};
+    }}
+    QListWidget#sessions::item:selected {{
+        background-color: {p["bg_raised"]};
+        color: {p["accent"]};
+    }}
+    QListWidget#sessions::item:hover:!selected {{
+        background-color: {p["bg_raised"]};
+    }}
     QLineEdit#input {{
         background-color: {p["bg_input"]};
         border: 1px solid {p["border"]};

@@ -22,20 +22,35 @@ Sends are funnelled through a queue owned by the connection task, so nothing can
 write to a socket that is in the middle of being swapped. Frames are the one
 exception to ordinary queueing: only the newest one is worth sending, so a frame
 waiting behind another frame replaces it instead of stacking up.
+
+**A live context cannot overflow — it forgets instead**, and v2 turns that into a
+decision rather than an accident. Sliding-window compression silently evicts the
+oldest content as 128k approaches; since frames dominate the budget, what
+evaporates is the visual history, with no error and no notice of what was
+dropped. So this manager watches its own estimated usage and, crossing ~100k,
+does the deliberate version of what the reconnect path already does: force the
+journal current, then rotate to a fresh session seeded from it — **dropping the
+resumption handle first**, because handle-based resumption would faithfully
+restore the very context being shed. Sliding-window compression stays on
+underneath as the backstop; if the estimate drifts low or a rotation fails,
+silent eviction remains infinitely better than termination.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
 from chiron.capture.frames import Frame
-from chiron.config.settings import Settings
+from chiron.capture.novelty import NoveltyDetector
+from chiron.config.settings import LIVE_CONTEXT_TOKENS, Settings
 from chiron.journal.log import JournalLog
 from chiron.journal.writers import JournalWriter
+from chiron.live import estimate
 from chiron.live.prompts import build_journal_context, build_system_instruction
 
 logger = logging.getLogger(__name__)
@@ -53,6 +68,21 @@ _BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
 #: How long shutdown waits for the session, and then the journal writer, to
 #: unwind before abandoning them. Quitting has to finish.
 STOP_TIMEOUT_SECONDS = 5.0
+
+#: Estimated context tokens at which consolidation becomes due — ~78% of the
+#: window. Well below it, because the trigger is allowed to wait for a quiet
+#: moment and waiting has to be affordable.
+COMPACTION_TOKENS = int(LIVE_CONTEXT_TOKENS * 0.78)
+
+#: The point at which waiting stops being affordable and the rotation happens
+#: mid-fight anyway. Gating must never be able to postpone into eviction, which
+#: is the exact failure compaction exists to replace.
+COMPACTION_DEADLINE_TOKENS = int(LIVE_CONTEXT_TOKENS * 0.90)
+
+#: Seconds since the last novelty spike after which the screen counts as quiet.
+#: A rotation is a few seconds of blindness; the whole point of gating is to
+#: spend them between fights rather than during the boss.
+QUIET_SECONDS = 4.0
 
 
 async def _settle(awaitable: Any, timeout: float, what: str) -> bool:
@@ -95,12 +125,23 @@ class LiveSessionManager(QObject):
         responseCompleted (str): The answer is complete; carries the full text.
         journalFolded (int): N journal entries were folded into the session.
         errorOccurred (str): Something went wrong, in words fit for the overlay.
+        frameSent (object, str): A frame reached the model, always with the
+            reason ``burst`` — in live mode every frame is streamed rather than
+            chosen, which is the difference the reason exists to record.
+        observerRan (object): Emitted for interface parity; never fires here.
+            There is no observer in live mode; the model is watching.
+        llmCall (object): One *estimated* :class:`~chiron.models.usage.LLMCallRecord`.
+            The Live API reports nothing billable, so these are arithmetic and
+            say so — see :mod:`chiron.live.estimate`.
+        compacted (object): The session was consolidated and rotated.
 
     Attributes:
         settings (Settings): Configuration used for the next connection.
         journal (JournalLog): The shared journal.
         writer (JournalWriter): Strategy handling tool calls and summarisation.
         status (str): Current connection status.
+        session_id (str): The gameplay session estimates are billed to. Runtime
+            state set by the app, like ``detected_game``.
     """
 
     statusChanged = Signal(str, str)
@@ -109,6 +150,10 @@ class LiveSessionManager(QObject):
     responseCompleted = Signal(str)
     journalFolded = Signal(int)
     errorOccurred = Signal(str)
+    frameSent = Signal(object, str)
+    observerRan = Signal(object)
+    llmCall = Signal(object)
+    compacted = Signal(object)
 
     def __init__(
         self,
@@ -127,6 +172,7 @@ class LiveSessionManager(QObject):
         #: instruction. Runtime state, not a setting: it is discovered, changes
         #: per play session, and must never be persisted as the player's choice.
         self.detected_game = ""
+        self.session_id = ""
 
         self._task: asyncio.Task[None] | None = None
         self._queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -140,6 +186,32 @@ class LiveSessionManager(QObject):
         self._frames_sent = 0
         self._current_cycle: asyncio.Task[None] | None = None
 
+        # --- context accounting, reset with every connection -----------------
+        #: Frames and transcript in the *current* connection's context, which is
+        #: not the same thing as the session totals: a rotation empties the
+        #: server's context, and an estimate that kept counting would trigger
+        #: another rotation moments later.
+        self._context_frames = 0
+        self._context_chars = 0
+        #: The server's own token count, when a message carries one. Trusted over
+        #: the estimate — it knows what it is actually holding — but absent often
+        #: enough that the estimate cannot be retired.
+        self._server_tokens: int | None = None
+        self._compacting = False
+        self._compactions = 0
+
+        # --- what one estimated turn covers ---------------------------------
+        self._turn_frames = 0
+        self._turn_prompt: list[str] = []
+        self._turn_started_at: str | None = None
+
+        # --- quiet-moment gating --------------------------------------------
+        #: A cheap novelty read over the frames already being sent, used for one
+        #: decision only: whether now is a bad moment to blink.
+        self._novelty = NoveltyDetector()
+        self._last_spike_at = 0.0
+        self._pending_question = False
+
     # ------------------------------------------------------------------ API
 
     @property
@@ -151,6 +223,30 @@ class LiveSessionManager(QObject):
     def frames_sent(self) -> int:
         """How many frames this manager has pushed to the API."""
         return self._frames_sent
+
+    @property
+    def compactions(self) -> int:
+        """How many times this manager has consolidated and rotated."""
+        return self._compactions
+
+    @property
+    def estimated_context_tokens(self) -> int:
+        """How full the model's context is, as best as can be known from here.
+
+        The server's ``usage_metadata`` when it has sent one, and the client-side
+        estimate otherwise. The deferral in the design doc resolved this way
+        round because the two disagree in a specific direction: the estimate
+        cannot see the system instruction, the seeded journal or the audio the
+        model generated, so it reads low, and reading low is the failure mode
+        that ends in silent eviction.
+        """
+        if self._server_tokens is not None:
+            return self._server_tokens
+        return estimate.estimate_context_tokens(
+            frames=self._context_frames,
+            media_resolution=self.settings.capture.media_resolution,
+            transcript_chars=self._context_chars,
+        )
 
     def start(self) -> None:
         """Open a session and keep it open until :meth:`stop`."""
@@ -180,6 +276,11 @@ class LiveSessionManager(QObject):
             task.cancel()
             await _settle(task, timeout, "live session")
         await _settle(self.writer.stop(), timeout, "journal writer")
+        # Frames sent since the last answer are real spend even though no turn
+        # ever came to attribute them to — a watched evening with no questions
+        # asked would otherwise estimate at zero, which is the wrong shape of
+        # wrong for a cost figure.
+        self._emit_turn_estimate("")
         self._set_status("stopped", "")
 
     def send_text(self, text: str) -> None:
@@ -191,6 +292,9 @@ class LiveSessionManager(QObject):
         if not text.strip():
             return
         self.writer.observe_user_message(text)
+        self._pending_question = True
+        self._turn_prompt.append(text)
+        self._context_chars += len(text)
         self._queue.put_nowait(("text", text))
 
     def send_frame(self, frame: Frame) -> None:
@@ -203,6 +307,9 @@ class LiveSessionManager(QObject):
         """
         self._latest_frame = frame
         self.writer.observe_frame(frame)
+        reading = self._novelty.observe(frame.signature, frame.captured_at)
+        if reading.spike:
+            self._last_spike_at = frame.captured_at
         if not self._frame_queued:
             self._frame_queued = True
             self._queue.put_nowait(("frame", None))
@@ -234,21 +341,52 @@ class LiveSessionManager(QObject):
         self.journalFolded.emit(len(entries))
         return len(entries)
 
-    def rotate(self, reason: str = "manual") -> None:
-        """Tear the current session down so the loop opens a fresh one."""
+    def rotate(self, reason: str = "manual", *, fresh: bool = False) -> None:
+        """Tear the current session down so the loop opens a fresh one.
+
+        Args:
+            reason (str): What prompted the rotation, for the status line.
+            fresh (bool): Drop the resumption handle first, so the new
+                connection starts blank and :meth:`_seed` replays the journal
+                into it. This is what separates a *compaction* rotate from a
+                reconnect: keeping the handle restores the server-side context,
+                which would faithfully resurrect everything being shed. Every
+                other caller wants the handle kept, which is why it is off by
+                default.
+        """
+        if fresh:
+            self._resumption_handle = None
         self._rotate_reason = reason
         task = self._current_cycle
         if task is not None and not task.done():
             task.cancel()
 
     def reset_observation(self) -> None:
-        """Nothing to reset: the Live API decides for itself what it has seen.
+        """Forget what the screen looked like before now.
 
-        Part of the :class:`~chiron.session.SessionProvider` surface, where the
-        non-live provider uses it to restart its novelty detector's warm-up. A
-        live session has no such state — the model watches continuously, and the
-        capture service's own scene-change baseline is reset separately.
+        The Live API decides for itself what it has seen, so there is no model
+        state to reset — but the novelty read that decides whether *now* is a
+        quiet moment is this manager's own, and comparing across a gap nobody
+        watched reads as an event every time.
         """
+        self._novelty.reset(time.time())
+        self._last_spike_at = 0.0
+
+    def reset_memory(self) -> None:
+        """Forget the conversation entirely — a new gameplay session started.
+
+        The live context lives on the server, so the only way to clear it is to
+        connect again without the handle that would restore it. A session that
+        is not running simply drops the handle, and the next connection is blank
+        by construction.
+        """
+        self._resumption_handle = None
+        self._response_buffer.clear()
+        self._model_has_spoken = False
+        self._reset_context_accounting()
+        self.reset_observation()
+        if self._task is not None and not self._task.done():
+            self.rotate("new session", fresh=True)
 
     def apply_settings(self, settings: Settings) -> None:
         """Adopt new settings for subsequent connections.
@@ -258,6 +396,128 @@ class LiveSessionManager(QObject):
         model id, credential and system instruction are fixed at connect time.
         """
         self.settings = settings
+
+    # ----------------------------------------------------------- compaction
+
+    def is_quiet(self, now: float | None = None) -> bool:
+        """Whether this is a good moment to blink.
+
+        Two conditions, both cheap and both already measured: no question is
+        waiting on an answer, and the screen has not spiked recently. A player
+        mid-boss is exactly who a few seconds of blindness costs the most.
+        """
+        current = time.time() if now is None else now
+        if self._pending_question:
+            return False
+        return current - self._last_spike_at >= QUIET_SECONDS
+
+    def compaction_due(self, now: float | None = None) -> str:
+        """Whether consolidation should happen now, and why.
+
+        Returns:
+            str: ``"quiet"`` when the threshold is crossed and the moment is
+                right, ``"deadline"`` when it is crossed hard enough that the
+                moment no longer gets a vote, and empty otherwise.
+        """
+        tokens = self.estimated_context_tokens
+        if tokens >= COMPACTION_DEADLINE_TOKENS:
+            return "deadline"
+        if tokens >= COMPACTION_TOKENS and self.is_quiet(now):
+            return "quiet"
+        return ""
+
+    def _consider_compaction(self) -> None:
+        """Start a consolidation if one is due and none is already running."""
+        if self._stopping or self._compacting or self.status != "live":
+            return
+        reason = self.compaction_due()
+        if not reason:
+            return
+        self._compacting = True
+        asyncio.ensure_future(self._compact_and_rotate(reason))
+
+    async def _compact_and_rotate(self, reason: str) -> None:
+        """Consolidate memory into the journal, then reconnect without a handle.
+
+        The live equivalent of compaction, in the only shape a server-side,
+        immutable context allows. In live mode the journal *is* the running
+        compaction summary, so the work is making it current — a sidecar pass
+        over the recent transcript when that strategy is active, then a forced
+        fold so the facts reach the session that is about to end, in case the
+        rotation fails. Then a fresh connection, which :meth:`_seed` opens by
+        replaying the journal.
+
+        Net effect: instead of amnesia, the model blinks for a few seconds and
+        comes back knowing a distilled version of the whole evening.
+        """
+        before = self.estimated_context_tokens
+        try:
+            summarise = getattr(self.writer, "summarise_once", None)
+            if callable(summarise):
+                try:
+                    await summarise()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    logger.warning("Sidecar pass before compaction failed: %s", error)
+            folded = self.fold_journal(force=True)
+            entries = len(self.journal)
+            logger.info(
+                "Compacting live session (%s) at ~%d tokens; %d entries folded",
+                reason,
+                before,
+                folded,
+            )
+            self.compacted.emit(
+                {
+                    "mode": "live_rotate",
+                    "summary": self.journal.render(
+                        self.journal.recent(self.settings.journal.fold_entry_limit)
+                    ),
+                    "tokens_before": before,
+                    "tokens_after": 0,
+                    "kept_tail_count": entries,
+                    "dropped_count": self._context_frames,
+                    "reason": reason,
+                }
+            )
+            self._compactions += 1
+            self.rotate("compaction", fresh=True)
+        finally:
+            self._compacting = False
+
+    def _reset_context_accounting(self) -> None:
+        """Start the context estimate again — a new connection holds nothing."""
+        self._context_frames = 0
+        self._context_chars = 0
+        self._server_tokens = None
+
+    # ------------------------------------------------------------- estimates
+
+    def _emit_turn_estimate(self, answer: str) -> None:
+        """Publish an estimated ledger row covering everything since the last one.
+
+        Arithmetic, not measurement: the Live API bills over a websocket and
+        reports nothing chiron can invoice against, so every row this emits is
+        tagged ``pricing_source="estimated"`` and every surface that renders a
+        total puts a ``~`` in front of it.
+        """
+        frames, self._turn_frames = self._turn_frames, 0
+        prompt = " ".join(self._turn_prompt)
+        self._turn_prompt.clear()
+        started_at, self._turn_started_at = self._turn_started_at, None
+        if not frames and not prompt and not answer.strip():
+            return
+        record = estimate.estimate_turn(
+            model_id=self.settings.live_model,
+            frames=frames,
+            media_resolution=self.settings.capture.media_resolution,
+            prompt_text=prompt,
+            output_text=answer,
+            session_id=self.session_id or None,
+            started_at=started_at,
+        )
+        self.llmCall.emit(record)
 
     # ------------------------------------------------------------- internals
 
@@ -370,6 +630,9 @@ class LiveSessionManager(QObject):
             model=self.settings.live_model, config=self._build_config()
         ) as session:
             self._model_has_spoken = False
+            # A new connection holds nothing yet — including one opened by a
+            # compaction rotate, which is the whole point of having rotated.
+            self._reset_context_accounting()
             self._set_status("live", self.settings.live_model)
             await self._seed(session)
 
@@ -454,6 +717,14 @@ class LiveSessionManager(QObject):
             video=types.Blob(data=frame.jpeg, mime_type="image/jpeg")
         )
         self._frames_sent += 1
+        self._context_frames += 1
+        self._turn_frames += 1
+        if self._turn_started_at is None:
+            self._turn_started_at = estimate.utc_now_iso()
+        self.frameSent.emit(frame, "burst")
+        # Frames are what fill a live context, so this is the natural place to
+        # ask whether it is getting full.
+        self._consider_compaction()
 
     async def _send_context(self, session: Any, text: str) -> None:
         """Append text to the conversation without requesting a reply."""
@@ -497,6 +768,13 @@ class LiveSessionManager(QObject):
         received_anything = False
         async for message in session.receive():
             received_anything = True
+            # The server has always sent this and the loop has always ignored
+            # it. It is the only authoritative answer to "how full is the
+            # context", which is the question compaction turns on.
+            reported = estimate.read_usage_metadata(message)
+            if reported is not None:
+                self._server_tokens = reported
+
             if message.session_resumption_update is not None:
                 update = message.session_resumption_update
                 if update.resumable and update.new_handle:
@@ -526,9 +804,15 @@ class LiveSessionManager(QObject):
             if content.turn_complete:
                 answer = "".join(self._response_buffer)
                 self._response_buffer.clear()
+                self._pending_question = False
+                self._context_chars += len(answer)
                 if answer.strip():
                     self.writer.observe_model_message(answer)
                     self.responseCompleted.emit(answer)
+                self._emit_turn_estimate(answer)
+                # A finished answer is the other natural checkpoint, and by
+                # definition a moment with no question waiting on one.
+                self._consider_compaction()
 
         if not received_anything:
             logger.info("Receive stream closed by the server")
@@ -611,4 +895,11 @@ def is_permanent_error(error: BaseException) -> bool:
     )
 
 
-__all__ = ["MEDIA_RESOLUTIONS", "LiveSessionManager", "is_permanent_error"]
+__all__ = [
+    "COMPACTION_DEADLINE_TOKENS",
+    "COMPACTION_TOKENS",
+    "MEDIA_RESOLUTIONS",
+    "QUIET_SECONDS",
+    "LiveSessionManager",
+    "is_permanent_error",
+]

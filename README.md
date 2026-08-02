@@ -178,7 +178,3 @@ chiron/
 ├── core/           # dormant general-purpose ReAct agent harness
 └── models/         # model plumbing used by the sidecar summarizer
 ```
-
-The full reasoning behind the original design—and the amendments made after
-testing against the real Live API—is in
-[the v0 architecture note](docs/00_v0_architecture.md).

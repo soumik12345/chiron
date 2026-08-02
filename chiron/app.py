@@ -26,6 +26,16 @@ builds the other — the same path as a session restart, one step longer.
 
 Saving settings goes through here too, because only this object knows which
 changes can be applied in place and which need the session rotated.
+
+v2 adds a second, slower clock to all of this: the **gameplay session**. Launch
+opens none. The first watch-start or first message creates one, and everything
+above is written down as it happens by
+:class:`~chiron.sessions.recorder.SessionRecorder`, which observes this object
+through the signals it was already wiring. **New Session** closes that record and
+performs the full reset — journal cleared, conversation cleared, observer
+baseline reset — which has a unifying effect on the code: "start a new session"
+becomes the one canonical reset path, and a fresh launch is simply *no session
+open yet* rather than a separate implicit reset nobody wrote down.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -57,6 +68,7 @@ from chiron.config.settings import (
 from chiron.journal.log import JournalEntry, JournalLog
 from chiron.journal.writers import JournalWriter, build_journal_writer
 from chiron.session import SessionProvider, build_session_provider
+from chiron.sessions.recorder import SessionRecorder
 from chiron.ui.hotkeys import GlobalHotkeyManager
 from chiron.ui.overlay import OverlayWindow
 from chiron.ui.settings_window import SettingsWindow
@@ -79,6 +91,8 @@ class ChironApp(QObject):
             selected model implies.
         capture (CaptureService): The screen capture thread.
         overlay (OverlayWindow): The floating chat panel.
+        recorder (SessionRecorder): The gameplay session being written to disk,
+            which outlives `session` across a live/non-live swap.
     """
 
     def __init__(
@@ -86,14 +100,27 @@ class ChironApp(QObject):
         settings: Settings,
         settings_path: Path,
         parent: QObject | None = None,
+        *,
+        sessions_root: Path | None = None,
     ) -> None:
-        """Build every component and wire them together."""
+        """Build every component and wire them together.
+
+        Args:
+            settings (Settings): The configuration to run with.
+            settings_path (Path): Where to persist it.
+            parent (QObject | None): Qt parent.
+            sessions_root (Path | None): Where gameplay sessions are recorded.
+                Defaults to the XDG data directory — deliberately *not* the
+                config directory, so ``--fresh-install`` cannot take a season of
+                play with it.
+        """
         super().__init__(parent)
         self.settings = settings
         self.settings_path = settings_path
         self.quit_requested = asyncio.Event()
         self._warned_not_watching = False
 
+        self.recorder = SessionRecorder(sessions_root, self)
         self.journal = JournalLog(max_entries=settings.journal.max_entries)
         self.writer: JournalWriter = self._build_writer()
         self.session: SessionProvider = build_session_provider(
@@ -125,6 +152,7 @@ class ChironApp(QObject):
             api_key=self.settings.resolved_api_key(),
             on_entry=self._on_journal_entry,
             live=self.settings.is_live,
+            usage_sink=self.recorder.record_llm_call,
         )
 
     def _connect(self) -> None:
@@ -138,6 +166,17 @@ class ChironApp(QObject):
         self.overlay.panelHidden.connect(self._remember_geometry)
         self.overlay.quitRequested.connect(self.request_quit)
         self.overlay.watchToggled.connect(self.set_watching)
+
+        self.overlay.newSessionRequested.connect(self.new_session)
+        self.overlay.historyRequested.connect(self.show_history)
+        self.overlay.sessionOpened.connect(self.open_session)
+        self.overlay.sessionRenamed.connect(self._on_session_renamed)
+        self.overlay.sessionDeleted.connect(self._on_session_deleted)
+        self.overlay.sessionThumbnailsDeleted.connect(self._on_thumbnails_deleted)
+
+        self.recorder.sessionChanged.connect(self.overlay.set_session)
+        self.recorder.sessionChanged.connect(self._on_session_changed)
+        self.recorder.costChanged.connect(self.overlay.set_cost)
 
         self.capture.frameCaptured.connect(self._on_frame)
         self.capture.sceneChanged.connect(self._on_scene_change)
@@ -153,17 +192,27 @@ class ChironApp(QObject):
         )
 
     def _connect_session(self) -> None:
-        """Wire the current session provider's signals to the overlay.
+        """Wire the current session provider's signals to the overlay and record.
 
         Separate from :meth:`_connect` because the provider is replaced whenever
         the selected model crosses the live/non-live boundary, and a new object
-        arrives with none of the old one's connections.
+        arrives with none of the old one's connections. The recorder is *not*
+        replaced with it — a gameplay session spans whatever the player does
+        with the model picker mid-evening — which is why its connections are
+        made here, to the new object, rather than once at construction.
         """
         self.session.statusChanged.connect(self.overlay.set_status)
         self.session.responseStarted.connect(self.overlay.start_response)
         self.session.responseDelta.connect(self.overlay.append_delta)
         self.session.responseCompleted.connect(self.overlay.end_response)
         self.session.errorOccurred.connect(self._on_session_error)
+
+        self.session.statusChanged.connect(self.recorder.record_status)
+        self.session.responseCompleted.connect(self._on_answer)
+        self.session.frameSent.connect(self.recorder.record_frame)
+        self.session.observerRan.connect(self.recorder.record_observer_run)
+        self.session.llmCall.connect(self.recorder.record_llm_call)
+        self.session.compacted.connect(self._on_compacted)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -233,11 +282,111 @@ class ChironApp(QObject):
             save_settings(self.settings, self.settings_path)
         except OSError as error:
             logger.warning("Could not save settings on exit: %s", error)
+        # Stopping the session emits its last events — the live provider's
+        # closing cost estimate among them — so the record is closed after it,
+        # not before.
         await self.session.stop()
+        self.recorder.shutdown()
 
     def request_quit(self) -> None:
         """Ask the main loop to shut the application down."""
         self.quit_requested.set()
+
+    # ------------------------------------------------------- gameplay sessions
+
+    def ensure_session(self) -> str:
+        """Open a gameplay session if one is not already open.
+
+        The two callers are the two things that count as starting to play:
+        watching the screen, and asking a question. Launching and sitting idle
+        deliberately records nothing.
+        """
+        game = self.settings.game_name.strip() or self._detected_game_label()
+        session_id = self.recorder.ensure_session(
+            game=game, mode="live" if self.settings.is_live else "nonlive"
+        )
+        self.session.session_id = session_id
+        return session_id
+
+    def new_session(self) -> None:
+        """Close the current record and forget everything.
+
+        The session boundary *is* the memory boundary: one session, one memory
+        state. So this is the canonical reset — journal, conversation, observer
+        baseline and transcript, in one place — and every other "start clean"
+        in the app is either this or the absence of a session at all.
+
+        Watching is deliberately untouched. Starting a new session is a decision
+        about memory, not about whether Chiron is allowed to see the screen, and
+        silently stopping the capture would be a surprising way to answer a
+        question nobody asked.
+        """
+        self.recorder.close_session()
+        self.journal.clear()
+        self.session.reset_memory()
+        self.session.session_id = ""
+        self.overlay.clear_transcript()
+        self.overlay.show_play()
+        self.overlay.append_system(
+            "New session. Chiron has forgotten the journal and the conversation; "
+            "the previous session is kept in history."
+        )
+        if self.watching:
+            # Watching without a record is a hole in the history, so re-open one
+            # immediately rather than waiting for the next question.
+            self.ensure_session()
+            self.recorder.record_watch(True)
+
+    def show_history(self) -> None:
+        """Show the session list, refreshed from the index."""
+        self.overlay.history.set_sessions(
+            self.recorder.sessions(), total_bytes=self.recorder.total_bytes()
+        )
+        self.overlay.show_history()
+
+    def open_session(self, session_id: str) -> None:
+        """Render one recorded session in the viewer."""
+        row = self.recorder.row_for(session_id)
+        events = self.recorder.read_session(session_id)
+        if row is None:
+            self.overlay.append_system("That session is no longer on disk.")
+            return
+        store = self.recorder.store_for(session_id)
+        self.overlay.viewer.show_session(
+            row,
+            events,
+            frames_directory=store.frames_directory if store is not None else None,
+        )
+        self.overlay.show_session_viewer()
+
+    def _on_session_changed(self, session_id: str, title: str) -> None:
+        """Keep the provider's billing label in step with the open record."""
+        self.session.session_id = session_id
+
+    def _on_session_renamed(self, session_id: str, title: str) -> None:
+        """Retitle a session and refresh whichever view is showing it."""
+        self.recorder.rename_session(session_id, title)
+        if self.overlay.current_view == 1:
+            self.show_history()
+
+    def _on_session_deleted(self, session_id: str) -> None:
+        """Delete a session outright, then refresh the list."""
+        self.recorder.delete_session(session_id)
+        self.show_history()
+
+    def _on_thumbnails_deleted(self, session_id: str) -> None:
+        """Delete a session's thumbnails, keeping its text, then refresh."""
+        freed = self.recorder.delete_thumbnails(session_id)
+        self.show_history()
+        if freed:
+            from chiron.sessions.render import format_bytes
+
+            self.overlay.append_system(f"Freed {format_bytes(freed)} of thumbnails.")
+
+    def _detected_game_label(self) -> str:
+        """The focused window's short name, or empty."""
+        current = self.window_tracker.current
+        return current.label if current is not None else ""
 
     # -------------------------------------------------------------- watching
 
@@ -265,6 +414,8 @@ class ChironApp(QObject):
             # A fresh look before anything else: while `self.watching` is still
             # False this cannot double-journal through _on_active_window.
             self.window_tracker.poll()
+            # The game is known now, so the auto-title can name it.
+            self.ensure_session()
             # The screen moved on while nobody was looking, so whatever the
             # session last saw is not a baseline to compare the next frame
             # against. The capture service resets its own; this resets the
@@ -273,9 +424,12 @@ class ChironApp(QObject):
 
         self.capture.set_watching(watching)
         self.overlay.set_watching(watching, self.settings.hotkeys.toggle_watching)
+        self.recorder.record_watch(watching)
 
         if watching:
             info = self.window_tracker.current
+            if info is not None:
+                self._record_game(info, changed=False)
             if info is not None and not self.settings.game_name.strip():
                 self.session.detected_game = info.describe()
                 self.journal.append(
@@ -311,6 +465,8 @@ class ChironApp(QObject):
         screen-watching assistant is otherwise baffling.
         """
         self.overlay.append_user(text)
+        self.ensure_session()
+        self.recorder.record_message("user", text)
         if self.watching:
             self.capture.request_burst("question")
         elif not self._warned_not_watching:
@@ -339,9 +495,36 @@ class ChironApp(QObject):
         """Report a session failure in the overlay."""
         self.overlay.append_system(f"⚠ {message}")
 
+    def _on_answer(self, text: str) -> None:
+        """Record a completed answer."""
+        self.recorder.record_message("assistant", text)
+
+    def _on_compacted(self, payload: dict) -> None:
+        """Record a consolidation and say so, briefly, in the transcript.
+
+        Visible on purpose. Compaction is the moment Chiron's memory of the last
+        hour changes shape, and a player who is told it happened can tell the
+        difference between "it forgot" and "it summarised" when a later answer
+        is thinner than they expected.
+        """
+        self.recorder.record_compaction(payload)
+        if payload.get("mode") == "live_rotate":
+            self.overlay.append_system(
+                "✂ Consolidating memory into the journal and reconnecting. "
+                "Chiron will blink for a moment."
+            )
+        else:
+            before = int(payload.get("tokens_before") or 0)
+            after = int(payload.get("tokens_after") or 0)
+            detail = f" ({before:,} → {after:,} tokens)" if before else ""
+            self.overlay.append_system(
+                f"✂ Summarised the earlier conversation{detail}."
+            )
+
     def _on_journal_entry(self, entry: JournalEntry) -> None:
-        """Show a new journal entry inline in the transcript."""
+        """Show a new journal entry inline in the transcript, and record it."""
         self.overlay.append_journal(entry)
+        self.recorder.record_journal_entry(entry)
 
     def _chiron_window_ids(self) -> set[int]:
         """Chiron's own window ids, which can never be "the player's window"."""
@@ -364,6 +547,16 @@ class ChironApp(QObject):
             self.journal.append(
                 f"The player switched to {info.describe()}.", source="system"
             )
+            self._record_game(info, changed=True)
+
+    def _record_game(self, info: WindowInfo, *, changed: bool) -> None:
+        """Note the focused application in the session record."""
+        self.recorder.record_game(
+            label=info.label,
+            identity=":".join(str(part) for part in info.identity),
+            described=info.describe(),
+            changed=changed,
+        )
 
     def _on_hotkey(self, name: str) -> None:
         """Act on a global hotkey."""
@@ -449,6 +642,14 @@ class ChironApp(QObject):
             # describes the frames it is about to be given.
             self.session.reset_observation()
 
+        # Without this the cost data is uninterpretable later: an evening whose
+        # per-call price triples halfway through is a mystery unless the record
+        # says the model changed. Field names only — the values include keys.
+        self.recorder.record_settings_changed(
+            _changed_fields(previous, new_settings),
+            "live" if new_settings.is_live else "nonlive",
+        )
+
         swap = previous.requires_provider_swap(new_settings)
         strategy_changed = (
             swap or previous.journal.strategy != new_settings.journal.strategy
@@ -476,13 +677,16 @@ class ChironApp(QObject):
             self.writer = self._build_writer()
         if swap_provider:
             detected = self.session.detected_game
+            session_id = self.session.session_id
             self.session = build_session_provider(
                 self.settings, self.journal, self.writer, self
             )
-            # Runtime state, not a setting, so nothing reloads it — but the game
-            # is still the game, and re-detecting it would need another window
-            # switch to happen first.
+            # Runtime state, not settings, so nothing reloads either — but the
+            # game is still the game (re-detecting it would need another window
+            # switch first), and the evening is still the same evening, which is
+            # the whole reason the record outlives the provider.
             self.session.detected_game = detected
+            self.session.session_id = session_id
             self._connect_session()
             self.overlay.append_system(
                 "Live mode." if self.settings.is_live else "Non-live mode."
@@ -502,6 +706,54 @@ class ChironApp(QObject):
         self.settings.overlay.position_y = y
         self.settings.overlay.width = width
         self.settings.overlay.height = height
+
+
+def describe_untouched_sessions(root: Path | None = None) -> list[str]:
+    """Lines for the ``--fresh-install`` plan saying play history is safe.
+
+    Args:
+        root (Path | None): Sessions directory. Defaults to the real one.
+
+    Returns:
+        list[str]: One "keep" line when sessions exist, empty otherwise — there
+            is no reassurance to give about a history nobody has.
+    """
+    from chiron.sessions.render import format_bytes
+    from chiron.sessions.store import SessionIndex, sessions_root
+
+    directory = root if root is not None else sessions_root()
+    if not directory.is_dir():
+        return []
+    index = SessionIndex(directory)
+    rows = index.rows()
+    if not rows:
+        return []
+    noun = "session" if len(rows) == 1 else "sessions"
+    return [
+        f"keep    {directory}{os.sep} "
+        f"({len(rows)} recorded {noun}, {format_bytes(index.total_bytes())}; "
+        "not Chiron's configuration)"
+    ]
+
+
+def _changed_fields(previous: Settings, current: Settings) -> list[str]:
+    """Top-level setting names that differ between two configurations.
+
+    Nested sections are reported as ``capture.frame_width`` rather than as
+    ``capture``, since "capture changed" is not a sentence that explains a cost
+    curve. Credentials are named but never valued.
+    """
+    changed: list[str] = []
+    before, after = previous.model_dump(), current.model_dump()
+    for name, old in before.items():
+        new = after.get(name)
+        if isinstance(old, dict) and isinstance(new, dict):
+            changed.extend(
+                f"{name}.{key}" for key, value in old.items() if new.get(key) != value
+            )
+        elif old != new:
+            changed.append(name)
+    return changed
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -580,6 +832,13 @@ def fresh_install(
     print("This will:", file=out)
     for line in plan.describe():
         print(f"  {line}", file=out)
+
+    # Sessions live in the data directory precisely so this command cannot reach
+    # them, and saying so is the difference between a guarantee and a hope:
+    # wiping an API key should not bundle in wiping a season of play.
+    for line in describe_untouched_sessions():
+        print(f"  {line}", file=out)
+
     if plan.holds_api_key:
         print(
             "\nYour saved Gemini API key is in that file and will be gone. "

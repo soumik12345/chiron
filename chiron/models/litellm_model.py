@@ -465,6 +465,7 @@ class LiteLLMModel(BaseModel):
         _, _, bare_model = split_model_id(self.model_id)
         return {
             "run_id": self.usage_labels.get("run_id"),
+            "session_id": self.usage_labels.get("session_id"),
             "book_id": self.usage_labels.get("book_id"),
             "agent_id": self.usage_labels.get("agent_id"),
             "model_id": self.model_id,

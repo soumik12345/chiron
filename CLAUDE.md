@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Chiron is a desktop AI gaming assistant: a frameless, always-on-top PySide6 overlay that watches the player's screen and answers questions about the game in a small text panel. It runs against either the Gemini Live API (a persistent websocket frames stream into) or an ordinary request/response multimodal endpoint via Google AI Studio or OpenRouter.
 
+It also **records what it saw**: every evening of play is a persistent session under `~/.local/share/chiron/sessions/` — journal, transcript, agent traces, frame thumbnails and per-call pricing — browsable and re-readable inside the overlay.
+
 Linux/X11 only (GNOME on Ubuntu is the tested setup) — screen capture (`mss`), global hotkeys (`python-xlib`) and active-window detection are all X11-specific, and degrade to inert rather than crashing on Wayland or a missing display. Requires Python 3.10+.
 
-Design docs, each with a build-time amendment worth reading before trusting the "Decisions" table above it: [docs/00_v0_architecture.md](docs/00_v0_architecture.md) (v0 — the amendment records two premises that turned out to be wrong once real API calls were made) and [docs/01_non_live_provider.md](docs/01_non_live_provider.md) (v1 — the non-live provider; its amendment records the resolved deferrals and two premises still untested against real games).
+Design docs, each with a build-time amendment worth reading before trusting the "Decisions" table above it: [docs/00_v0_architecture.md](docs/00_v0_architecture.md) (v0 — the amendment records two premises that turned out to be wrong once real API calls were made), [docs/01_non_live_provider.md](docs/01_non_live_provider.md) (v1 — the non-live provider; its amendment records the resolved deferrals and two premises still untested against real games) and [docs/02_sessions_and_compaction.md](docs/02_sessions_and_compaction.md) (v2 — gameplay sessions and context compaction; its amendment records one design detail that inverted at build time and three premises that need a real long evening to confirm).
 
 ## Commands
 
@@ -19,6 +21,8 @@ uv run chiron --fresh-install              # wipe saved config + API key, with c
 uv run pytest                              # full suite — no network or display needed
 uv run pytest tests/test_capture.py -q     # one file
 uv run pytest tests/test_novelty.py -q     # observer trigger + novelty detector
+uv run pytest tests/test_sessions.py -q    # session store, index, recorder, viewer render
+uv run pytest tests/test_compaction.py -q  # both modes' compaction + live cost estimation
 uv run pytest tests/test_ui.py::test_watch_button_shows_state_and_asks_for_the_other_one  # one test
 uv run ruff check chiron/ tests/
 uv run ruff format chiron/ tests/
@@ -32,7 +36,9 @@ Qt tests need `QT_QPA_PLATFORM=offscreen` when there is no real display (CI, thi
 
 ### Two things live in this repo, one of them dormant
 
-`chiron/core/` and `chiron/models/` are a **pre-existing, general-purpose ReAct agent harness** (durable JSONL sessions with branching, a typed event stream, litellm-backed model wrapper with per-call cost accounting, tool router with deferred tools) carried over from a prior project. It is not wired into the overlay's control flow. The only load-bearing connection is `chiron/journal/writers.py`'s `SidecarJournal`, which reuses `chiron.models.litellm_model.LiteLLMModel` for its periodic summarisation calls — that's why journal usage lands in the same litellm plumbing as everything else. Don't assume `core/react.py`'s `ReactAgent` drives anything at runtime; it currently doesn't.
+`chiron/core/` and `chiron/models/` are a **pre-existing, general-purpose ReAct agent harness** (durable JSONL sessions with branching, a typed event stream, litellm-backed model wrapper with per-call cost accounting, tool router with deferred tools) carried over from a prior project. `chiron/core/` is not wired into the overlay's control flow — don't assume `core/react.py`'s `ReactAgent` drives anything at runtime; it currently doesn't. `chiron/models/` very much is: `LiteLLMModel` is what every non-live call goes through, and its `usage_sink` seam is what feeds v2's cost record.
+
+Note `chiron/core/session.py` (the dormant branching store) versus `chiron/session.py` (the provider seam) versus `chiron/sessions/` (v2's gameplay sessions). Three different things called "session", and only the last two run.
 
 That harness is also why `weave` is a dependency: `LiteLLMModel.acompletion()` (and several `core/` functions) carry a `@weave.op` trace decorator, but `weave.init()` is only ever called from `core/react.py`'s startup path. Since nothing in the overlay's runtime calls into `core/`, those decorators are inert no-ops in the app as it actually runs — don't read `@weave.op`'s presence as evidence that a call is traced anywhere.
 
@@ -68,11 +74,35 @@ The detector resets when watching starts (`ChironApp.set_watching` → `session.
 
 `chiron/app.py:main()` wires a single `qasync.QEventLoop` shared by Qt and asyncio — no thread-bridging signals between them. The one real thread is `chiron/capture/service.py`'s `CaptureService`, which grabs and encodes screenshots off the Qt thread and reports back via Qt signals (automatically queued across the thread boundary). Everything else — the Live session, the journal, the settings window — is coroutines and widgets on the one loop.
 
-`ChironApp` (`chiron/app.py`) is the wiring hub: it owns every component (`journal`, `writer`, `session`, `capture`, `overlay`, `hotkeys`) and every cross-component signal connection lives in `_connect()`. When adding a new interaction, that's the method to extend, not the individual components. The session's own connections are split into `_connect_session()`, because that object is replaced whenever the model selection crosses the live/non-live boundary.
+`ChironApp` (`chiron/app.py`) is the wiring hub: it owns every component (`journal`, `writer`, `session`, `capture`, `overlay`, `hotkeys`, `recorder`) and every cross-component signal connection lives in `_connect()`. When adding a new interaction, that's the method to extend, not the individual components. The session's own connections are split into `_connect_session()`, because that object is replaced whenever the model selection crosses the live/non-live boundary — the recorder is *not*, and its connections to the provider are remade there too.
 
-### Watching is a state, not a lifecycle
+### Watching is a state, not a lifecycle — and so is the gameplay session
 
 Chiron launches with the capture thread *running* but not *watching* (`CaptureService._watching` is an `Event`, separate from thread liveness). Nothing is captured, and no Live session opens, until the user starts watching — by hotkey (`ctrl+alt+w` toggles; separate start/stop bindings are also configurable) or the overlay's eye button. `ChironApp.set_watching()` is the single place that starts/stops both capture and the Live session together; anything that flips watching state should go through it rather than poking `capture` or `session` directly. Starting watching also resets the scene-change baseline (`_last_signature`, `scheduler.last_capture`) so resuming after a pause never reads as a false scene change.
+
+A **gameplay session** is a second, slower axis on the same idea. Launch opens none; `ChironApp.ensure_session()` creates one lazily on the first watch-start or first message, so an idle overlay records nothing. `ChironApp.new_session()` is the one canonical reset in the codebase — it closes the record, clears the journal, calls `session.reset_memory()` and empties the transcript — and a fresh launch is simply "no session open yet" rather than a separate implicit reset. Watching and sessions are independent: one session spans many watch spans, and `new_session()` deliberately does not stop watching.
+
+### The session record is an observer, and outlives the provider
+
+`chiron/sessions/` (plural — not `chiron/session.py`) persists an evening of play under `$XDG_DATA_HOME/chiron/sessions/`: one directory per session holding an append-only `events.jsonl` and ~256 px JPEG thumbnails of every frame that reached a model, plus one `index.json` the browser reads so listing never opens an event file. **The data dir, not the config dir**, so `--fresh-install`'s `plan_removal()` cannot reach it by construction; `describe_untouched_sessions()` says so in the plan output.
+
+`SessionRecorder` (`chiron/sessions/recorder.py`) is owned by `ChironApp` and observes it through signals — it never participates, swallows its own failures, buffers appends on a 2 s timer, and survives a live/non-live swap exactly as the journal does. Four provider signals exist for it (`frameSent`, `observerRan`, `llmCall`, `compacted`) alongside the five the overlay already used; `SessionProvider` describes all nine, and each mode simply never emits the ones it has no opinion about.
+
+Two invariants to preserve when touching this: the recorder's incremental counters must match what `chiron/sessions/store.py`'s `summarise()` computes by rescan (the index is a *cache* of the stream, and `SessionIndex.rebuild()` proves it), and thumbnails are memoised by capture-time-plus-shape rather than by `id(frame)` — a freed frame's address gets reused, which silently deduplicates distinct captures.
+
+### Cost is measured in non-live mode and estimated in live mode
+
+`LiteLLMModel.usage_sink` is the seam, and it is now actually installed: `NonLiveSessionManager._model()` attaches it to every throwaway wrapper it builds, and `build_journal_writer(..., usage_sink=…)` attaches it to the live sidecar's long-lived one. Every call lands as an `llm_call` event and rolls up per model and per kind.
+
+The Live API reports nothing billable, so `chiron/live/estimate.py` produces `pricing_source="estimated"` rows from frames × per-frame token cost + transcript length against a hand-kept rate table. **Every surface that renders a total checks that flag and prefixes `~`** (`CostRollup.render()`, the overlay footer, the viewer's summary line). Adding a new place that shows money means honouring it too.
+
+Adding a call kind means adding it to the `LLMCallKind` Literal in `chiron/models/usage.py`. That Literal used to hold only `turn` and `compaction` while the app passed `nonlive_qa` and `journal_sidecar`, so every record raised on construction and died inside the try/except that wraps usage accounting — nothing was recorded and nothing said so.
+
+### Compaction is deliberate in both modes, and asymmetric
+
+Non-live (`chiron/nonlive/compaction.py`, orchestrated by `NonLiveSessionManager._call_with_history`): deduplicate, then measure, then retry. The journal block is stripped as a turn enters history (`_remember(..., history_text=…)`) because it is prepended to every question and twenty exchanges used to carry twenty copies. Then `should_compact()` prices the assembled request against the model's window before each call and summarises above 85%; `is_context_overflow()` catches litellm's typed `ContextWindowExceededError` as a backstop, compacts, and retries once. Token counting projects image parts out first — a data URI is text to a token counter, and enormous.
+
+Live (`LiveSessionManager._compact_and_rotate`): the context is server-side and immutable, so the equivalent is a sidecar pass + forced journal fold, then `rotate("compaction", fresh=True)`. **The `fresh=True` is the whole point** — it drops the resumption handle, which would otherwise faithfully restore the context being shed. Every other caller of `rotate()` wants the handle kept. Gated on a quiet moment (no pending question, no novelty spike for 4 s) with a hard deadline so gating can never postpone into eviction; sliding-window compression stays on underneath as the backstop.
 
 ### The game is detected before watching starts, not when
 
@@ -96,6 +126,12 @@ Session errors are split into permanent vs. transient (`is_permanent_error()` in
 `LiveSessionManager.fold_journal()` periodically pushes new entries back into the live session as plain text — this is what lets facts outlive the frames the sliding-window compression evicts, and it's also the reconnect-seed mechanism (`_seed()` replays the recent journal into a freshly opened session). The non-live implementation returns 0; see the memory-inversion section above.
 
 Changing `journal.strategy` at runtime requires tearing down and rebuilding the writer (`ChironApp._restart_session(rebuild_writer=True)`), since the two live strategies install different things into the Live session config (function declarations vs. nothing). A mode swap forces the same rebuild.
+
+### The overlay is a three-view stack, not a transcript
+
+`chiron/ui/overlay.py` holds a `QStackedWidget` with three pages — `PLAY_VIEW` (today's transcript), `HISTORY_VIEW` and `SESSION_VIEW` (both in `chiron/ui/history_view.py`). Navigation is a small back-stack: `overlay.back()` walks one step, `Escape` calls it and only hides the panel once already on play, and `start_response()` snaps to play so an answer arriving mid-browse is never missed. Entering a review view temporarily enlarges the panel and stores the play size in `_play_size`; `current_geometry()` reports the *play* size while that is set, so opening history once cannot permanently resize the thing floating over the game.
+
+Rendering a recorded session is pure: `chiron/sessions/render.py` turns events into HTML with thumbnails inline (`<img src="…">` at absolute paths), so the viewer's whole output is assertable without a display. A thumbnail that has been deleted to reclaim disk renders as a dim placeholder, never a broken image.
 
 ### Settings: edit-a-copy, whole-object apply
 
