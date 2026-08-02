@@ -1,4 +1,4 @@
-"""The three views in one overlay, and the session lifecycle behind them.
+"""The views in one overlay, and the session lifecycle behind them.
 
 The overlay tests drive real widgets on Qt's offscreen backend. The app tests
 use the stubbed session provider from `conftest`, so nothing here opens a socket
@@ -19,7 +19,6 @@ from chiron.journal.log import JournalEntry
 from chiron.models.usage import LLMCallRecord
 from chiron.sessions.store import SessionRow
 from chiron.ui.overlay import (
-    HISTORY_VIEW,
     PLAY_VIEW,
     REVIEW_MIN_HEIGHT,
     SESSION_VIEW,
@@ -56,9 +55,8 @@ def test_the_panel_opens_on_the_game(overlay):
     assert overlay.current_view == PLAY_VIEW
 
 
-def test_history_and_the_viewer_are_two_steps_from_play(overlay):
-    overlay.show_history()
-    assert overlay.current_view == HISTORY_VIEW
+def test_the_viewer_is_one_step_from_play(overlay):
+    """Choosing a session is a popup, so reading one is the only page transition."""
     overlay.show_session_viewer()
     assert overlay.current_view == SESSION_VIEW
 
@@ -80,10 +78,6 @@ def test_escape_walks_back_before_it_hides(overlay):
     overlay.show_session_viewer()
 
     escape()
-    assert overlay.current_view == HISTORY_VIEW
-    assert overlay.isVisible() is True
-
-    escape()
     assert overlay.current_view == PLAY_VIEW
     assert overlay.isVisible() is True
 
@@ -94,7 +88,7 @@ def test_escape_walks_back_before_it_hides(overlay):
 def test_reviewing_grows_the_panel_and_returning_shrinks_it(overlay):
     play = (overlay.width(), overlay.height())
 
-    overlay.show_history()
+    overlay.show_session_viewer()
     assert overlay.height() >= REVIEW_MIN_HEIGHT
 
     overlay.show_play()
@@ -102,8 +96,8 @@ def test_reviewing_grows_the_panel_and_returning_shrinks_it(overlay):
 
 
 def test_a_grown_panel_never_becomes_the_remembered_placement(overlay):
-    """Opening history once must not permanently resize what floats over the game."""
-    overlay.show_history()
+    """Opening a session once must not permanently resize what floats over the game."""
+    overlay.show_session_viewer()
 
     _, _, width, height = overlay.current_geometry()
 
@@ -112,7 +106,7 @@ def test_a_grown_panel_never_becomes_the_remembered_placement(overlay):
 
 def test_the_prompt_is_hidden_while_reviewing(overlay):
     """There is nothing to ask a session that finished on Tuesday."""
-    overlay.show_history()
+    overlay.show_session_viewer()
     assert overlay.input.isVisible() is False
 
     overlay.show_play()
@@ -196,42 +190,71 @@ def test_a_refreshed_counter_line_keeps_the_cost(overlay):
     assert overlay.footer.text() == "second  ·  $0.20"
 
 
-# --------------------------------------------------------------- the history
+# -------------------------------------------------------- the session picker
 
 
 def test_the_list_shows_what_the_index_knows(overlay):
-    overlay.history.set_sessions([_row("a"), _row("b")], total_bytes=4096)
+    overlay.picker.set_sessions([_row("a"), _row("b")], total_bytes=4096)
 
-    assert overlay.history.list.count() == 2
-    assert "4 KB on disk" in overlay.history.total.text()
+    assert overlay.picker.list.count() == 2
+    assert "4 KB on disk" in overlay.picker.total.text()
 
 
 def test_the_pinned_total_is_the_retention_policy(overlay):
-    overlay.history.set_sessions([], total_bytes=0)
-    assert "No sessions" in overlay.history.total.text()
+    overlay.picker.set_sessions([], total_bytes=0)
+    assert "No sessions" in overlay.picker.total.text()
 
 
 def test_search_filters_by_title_and_game(overlay):
-    overlay.history.set_sessions(
+    overlay.picker.set_sessions(
         [
             _row("a", title="Elden Ring — Aug 2", game="Elden Ring"),
             _row("b", title="Hades run", game="Hades"),
         ]
     )
 
-    overlay.history.search.setText("hades")
+    overlay.picker.search.setText("hades")
 
-    assert overlay.history.list.count() == 1
+    assert overlay.picker.list.count() == 1
 
 
-def test_tapping_a_row_asks_for_it(overlay):
+def test_tapping_a_row_asks_for_it_and_closes_the_popup(overlay):
     opened: list[str] = []
     overlay.sessionOpened.connect(opened.append)
-    overlay.history.set_sessions([_row("a")])
+    overlay.picker.set_sessions([_row("a")])
+    overlay.picker.show()
 
-    overlay.history.list.itemClicked.emit(overlay.history.list.item(0))
+    overlay.picker.list.itemClicked.emit(overlay.picker.list.item(0))
 
     assert opened == ["a"]
+    assert overlay.picker.isVisible() is False
+
+
+def test_the_picker_never_resizes_the_panel(overlay):
+    """The whole point of a popup: choosing costs no geometry."""
+    before = (overlay.width(), overlay.height())
+    overlay.picker.set_sessions([_row("a")])
+
+    overlay.open_session_picker()
+
+    assert (overlay.width(), overlay.height()) == before
+    assert overlay.current_view == PLAY_VIEW
+
+
+def test_managing_a_session_happens_on_the_one_being_looked_at(overlay):
+    """Rename and the two deletes moved off list rows and into the viewer."""
+    deleted: list[str] = []
+    overlay.sessionDeleted.connect(deleted.append)
+    overlay.viewer.show_session(_row("a"), [])
+
+    overlay.viewer.deleteRequested.emit(overlay.viewer.session_id)
+
+    assert deleted == ["a"]
+
+
+def test_nothing_can_be_managed_when_nothing_is_open(overlay):
+    overlay.viewer.clear()
+    assert overlay.viewer.manage_button.isEnabled() is False
 
 
 def test_the_viewer_pins_the_summary_and_renders_the_events(overlay):
@@ -403,7 +426,7 @@ def test_opening_a_session_that_is_gone_says_so(app):
     assert "no longer on disk" in app.overlay.transcript.toHtml()
 
 
-def test_renaming_from_the_history_view_sticks(app):
+def test_renaming_a_session_sticks(app):
     app.set_watching(True)
     session_id = app.recorder.session_id
 
@@ -412,14 +435,29 @@ def test_renaming_from_the_history_view_sticks(app):
     assert app.recorder.title == "The night I beat Margit"
 
 
-def test_deleting_from_the_history_view_removes_it(app):
+def test_deleting_the_session_being_viewed_leaves_the_viewer(app):
     app.set_watching(True)
     session_id = app.recorder.session_id
+    app.open_session(session_id)
 
     app.overlay.sessionDeleted.emit(session_id)
 
     assert app.recorder.index.get(session_id) is None
-    assert app.overlay.current_view == HISTORY_VIEW
+    assert app.overlay.current_view == PLAY_VIEW
+    assert app.overlay.viewer.session_id == ""
+
+
+def test_deleting_a_session_you_are_not_reading_leaves_the_view_alone(app):
+    app.set_watching(True)
+    open_id = app.recorder.session_id
+    app.new_session()
+    app.open_session(open_id)
+    other = app.recorder.session_id
+
+    app.overlay.sessionDeleted.emit(other)
+
+    assert app.overlay.current_view == SESSION_VIEW
+    assert app.overlay.viewer.session_id == open_id
 
 
 def test_deleting_thumbnails_keeps_the_session(app):
@@ -439,8 +477,8 @@ def test_the_history_button_refreshes_from_the_index(app):
 
     app.show_history()
 
-    assert app.overlay.current_view == HISTORY_VIEW
-    assert app.overlay.history.list.count() == 1
+    assert app.overlay.picker.isVisible() is True
+    assert app.overlay.picker.list.count() == 1
 
 
 def test_a_provider_swap_keeps_the_evening(app, monkeypatch):

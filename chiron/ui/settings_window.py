@@ -849,6 +849,16 @@ class SettingsWindow(QWidget):
         )
         form.addRow("Show / hide overlay", self.toggle_hotkey_edit)
 
+        self.journal_hotkey_edit = self._register(
+            "hotkey_journal", HotkeyEdit(), "textEdited"
+        )
+        form.addRow("Show / hide journal", self.journal_hotkey_edit)
+        self._hint(
+            form,
+            "The journal column, beside the conversation — what Chiron has "
+            "written down and will still remember in an hour.",
+        )
+
         self.settings_hotkey_edit = self._register(
             "hotkey_settings", HotkeyEdit(), "textEdited"
         )
@@ -958,6 +968,7 @@ class SettingsWindow(QWidget):
             self.watch_toggle_hotkey_edit.setText(settings.hotkeys.toggle_watching)
             self.start_watch_hotkey_edit.setText(settings.hotkeys.start_watching)
             self.stop_watch_hotkey_edit.setText(settings.hotkeys.stop_watching)
+            self.journal_hotkey_edit.setText(settings.hotkeys.toggle_journal)
         finally:
             self._loading = False
         self._refresh_derived()
@@ -1027,6 +1038,7 @@ class SettingsWindow(QWidget):
         settings.hotkeys.toggle_watching = self.watch_toggle_hotkey_edit.text().strip()
         settings.hotkeys.start_watching = self.start_watch_hotkey_edit.text().strip()
         settings.hotkeys.stop_watching = self.stop_watch_hotkey_edit.text().strip()
+        settings.hotkeys.toggle_journal = self.journal_hotkey_edit.text().strip()
         return settings
 
     def _save(self) -> None:

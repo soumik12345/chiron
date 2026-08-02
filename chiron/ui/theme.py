@@ -30,6 +30,20 @@ PALETTE = {
     "error": "#e5736a",
 }
 
+#: Journal category -> colour, for the drawer. Categories are a hint rather than
+#: a schema, so anything absent here falls back to dim text rather than being
+#: coloured at random — see :func:`chiron.ui.journal_drawer.category_colour`.
+JOURNAL_CATEGORY_COLOURS = {
+    "location": PALETTE["user"],
+    "objective": PALETTE["accent"],
+    "combat": PALETTE["warn"],
+    "death": PALETTE["error"],
+    "item": PALETTE["live"],
+    "npc": PALETTE["user"],
+    "progress": PALETTE["live"],
+    "note": PALETTE["text_dim"],
+}
+
 #: Status name -> dot colour, for the overlay header.
 STATUS_COLOURS = {
     "idle": PALETTE["text_faint"],
@@ -81,6 +95,50 @@ def overlay_stylesheet(font_size: int = 11) -> str:
         background-color: transparent;
         border: none;
         selection-background-color: {p["accent_dim"]};
+    }}
+    /* The drawer is a surface, not a hairline. A bare `border-left` left the
+       column reading as leftover space with text floating in it — a faintly
+       raised, rounded panel says "this is a different instrument" with no rule
+       needed, and gives the entries something to sit on. */
+    QWidget#journalDrawer {{
+        background-color: {p["bg_raised"]};
+        border: 1px solid {p["border"]};
+        border-radius: 8px;
+    }}
+    QLabel#drawerTitle {{
+        color: {p["accent"]};
+        font-size: {max(7, font_size - 3)}pt;
+        font-weight: 700;
+        letter-spacing: 1.5px;
+    }}
+    /* The count is a fact about the column, not a notification: a quiet chip
+       rather than a badge. */
+    QLabel#drawerCount {{
+        color: {p["text_dim"]};
+        background-color: {p["bg_input"]};
+        border-radius: 7px;
+        font-size: {max(7, font_size - 3)}pt;
+        padding: 1px 6px;
+    }}
+    QFrame#drawerRule {{
+        background-color: {p["border"]};
+        border: none;
+    }}
+    QToolButton#drawerClose {{
+        color: {p["text_faint"]};
+        font-size: {font_size + 2}pt;
+        padding: 0px 5px;
+    }}
+    QTextBrowser#journalBody {{
+        background-color: transparent;
+        border: none;
+        font-size: {max(7, font_size - 2)}pt;
+        selection-background-color: {p["accent_dim"]};
+    }}
+    /* An unread count is information, not an alert: it takes the accent so it
+       is findable, and nothing that moves. */
+    QToolButton#journalToggle[unread="true"] {{
+        color: {p["accent"]};
     }}
     /* The session title is a button that must not read as one: it is a label
        you can click, and a button-shaped control here would compete with the
@@ -282,4 +340,10 @@ def settings_stylesheet() -> str:
     """
 
 
-__all__ = ["PALETTE", "STATUS_COLOURS", "overlay_stylesheet", "settings_stylesheet"]
+__all__ = [
+    "JOURNAL_CATEGORY_COLOURS",
+    "PALETTE",
+    "STATUS_COLOURS",
+    "overlay_stylesheet",
+    "settings_stylesheet",
+]

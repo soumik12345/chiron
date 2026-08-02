@@ -70,7 +70,7 @@ from chiron.journal.writers import JournalWriter, build_journal_writer
 from chiron.session import SessionProvider, build_session_provider
 from chiron.sessions.recorder import SessionRecorder
 from chiron.ui.hotkeys import GlobalHotkeyManager
-from chiron.ui.overlay import OverlayWindow
+from chiron.ui.overlay import SESSION_VIEW, OverlayWindow
 from chiron.ui.settings_window import SettingsWindow
 
 logger = logging.getLogger(__name__)
@@ -258,6 +258,7 @@ class ChironApp(QObject):
             "toggle_watching": hotkeys.toggle_watching,
             "start_watching": hotkeys.start_watching,
             "stop_watching": hotkeys.stop_watching,
+            "toggle_journal": hotkeys.toggle_journal,
         }
 
     def _watch_hotkey_hint(self) -> str:
@@ -326,6 +327,7 @@ class ChironApp(QObject):
         self.session.reset_memory()
         self.session.session_id = ""
         self.overlay.clear_transcript()
+        self.overlay.clear_journal()
         self.overlay.show_play()
         self.overlay.append_system(
             "New session. Chiron has forgotten the journal and the conversation; "
@@ -338,11 +340,11 @@ class ChironApp(QObject):
             self.recorder.record_watch(True)
 
     def show_history(self) -> None:
-        """Show the session list, refreshed from the index."""
-        self.overlay.history.set_sessions(
+        """Drop the session picker open, refreshed from the index."""
+        self.overlay.picker.set_sessions(
             self.recorder.sessions(), total_bytes=self.recorder.total_bytes()
         )
-        self.overlay.show_history()
+        self.overlay.open_session_picker()
 
     def open_session(self, session_id: str) -> None:
         """Render one recorded session in the viewer."""
@@ -364,24 +366,38 @@ class ChironApp(QObject):
         self.session.session_id = session_id
 
     def _on_session_renamed(self, session_id: str, title: str) -> None:
-        """Retitle a session and refresh whichever view is showing it."""
+        """Retitle a session, re-rendering the viewer if it is showing it."""
         self.recorder.rename_session(session_id, title)
-        if self.overlay.current_view == 1:
-            self.show_history()
+        if self._viewing(session_id):
+            self.open_session(session_id)
 
     def _on_session_deleted(self, session_id: str) -> None:
-        """Delete a session outright, then refresh the list."""
+        """Delete a session outright, leaving the viewer if it was showing it."""
+        viewing = self._viewing(session_id)
         self.recorder.delete_session(session_id)
-        self.show_history()
+        if viewing:
+            self.overlay.viewer.clear()
+            self.overlay.show_play()
 
     def _on_thumbnails_deleted(self, session_id: str) -> None:
-        """Delete a session's thumbnails, keeping its text, then refresh."""
+        """Delete a session's thumbnails, keeping its text, then re-render."""
         freed = self.recorder.delete_thumbnails(session_id)
-        self.show_history()
+        if self._viewing(session_id):
+            # The rendered page is full of <img> tags pointing at files that
+            # have just gone; re-rendering is what turns them into the dim
+            # placeholders the renderer has for exactly this.
+            self.open_session(session_id)
         if freed:
             from chiron.sessions.render import format_bytes
 
             self.overlay.append_system(f"Freed {format_bytes(freed)} of thumbnails.")
+
+    def _viewing(self, session_id: str) -> bool:
+        """Whether the viewer is currently showing `session_id`."""
+        return (
+            self.overlay.current_view == SESSION_VIEW
+            and self.overlay.viewer.session_id == session_id
+        )
 
     def _detected_game_label(self) -> str:
         """The focused window's short name, or empty."""
@@ -522,7 +538,7 @@ class ChironApp(QObject):
             )
 
     def _on_journal_entry(self, entry: JournalEntry) -> None:
-        """Show a new journal entry inline in the transcript, and record it."""
+        """Show a new journal entry in the drawer, and record it."""
         self.overlay.append_journal(entry)
         self.recorder.record_journal_entry(entry)
 
@@ -544,9 +560,14 @@ class ChironApp(QObject):
         if not self.settings.game_name.strip():
             self.session.detected_game = info.describe()
         if self.watching:
-            self.journal.append(
+            entry = self.journal.append(
                 f"The player switched to {info.describe()}.", source="system"
             )
+            # Straight into the log rather than through the writer, so this is
+            # the one entry `on_entry` never sees — and the drawer would show a
+            # count one short of the footer's if it were not shown by hand.
+            if entry is not None:
+                self.overlay.append_journal(entry)
             self._record_game(info, changed=True)
 
     def _record_game(self, info: WindowInfo, *, changed: bool) -> None:
@@ -570,6 +591,15 @@ class ChironApp(QObject):
             self.set_watching(True)
         elif name == "stop_watching":
             self.set_watching(False)
+        elif name == "toggle_journal":
+            if self.overlay.isVisible():
+                self.overlay.toggle_journal()
+            else:
+                # Asking for the journal while the panel is hidden is asking to
+                # see it. Toggling here would show the panel and, if the drawer
+                # was already open, close the one thing that was wanted.
+                self.overlay.show_and_focus()
+                self.overlay.set_journal_open(True)
 
     def _refresh_footer(self) -> None:
         """Update the overlay's small status line."""
@@ -616,10 +646,15 @@ class ChironApp(QObject):
             new_settings (Settings): The configuration to adopt.
         """
         previous = self.settings
-        # Placement is owned by the overlay, not the settings form.
+        # Placement is owned by the overlay, not the settings form — and so is
+        # the drawer, which is a thing you open mid-fight rather than a
+        # preference you set. Both are read back off the live panel here, or
+        # saving settings would quietly close it.
         self._remember_geometry()
         new_settings.overlay.position_x = previous.overlay.position_x
         new_settings.overlay.position_y = previous.overlay.position_y
+        new_settings.overlay.journal_open = previous.overlay.journal_open
+        new_settings.overlay.journal_width = previous.overlay.journal_width
         self.settings = new_settings
 
         try:
@@ -700,12 +735,18 @@ class ChironApp(QObject):
             self.session.start()
 
     def _remember_geometry(self) -> None:
-        """Record the overlay's position and size into settings."""
+        """Record the overlay's placement and drawer state into settings.
+
+        `current_geometry()` reports the width *without* the journal column, so
+        the two are independent: an evening reopens the size it was and with the
+        drawer the way it was left.
+        """
         x, y, width, height = self.overlay.current_geometry()
         self.settings.overlay.position_x = x
         self.settings.overlay.position_y = y
         self.settings.overlay.width = width
         self.settings.overlay.height = height
+        self.settings.overlay.journal_open = self.overlay.journal_open
 
 
 def describe_untouched_sessions(root: Path | None = None) -> list[str]:

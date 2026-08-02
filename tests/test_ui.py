@@ -41,13 +41,14 @@ def test_streaming_builds_one_message(overlay):
     assert text.count("A skeleton on the bridge.") == 1
 
 
-def test_journal_entries_appear_inline(overlay):
+def test_journal_entries_stay_out_of_the_conversation(overlay):
+    """They live in the drawer now — see tests/test_journal_drawer.py."""
     overlay.append_journal(
         JournalEntry(
             timestamp=1_700_000_000.0, note="Lit the bonfire.", category="progress"
         )
     )
-    assert "Lit the bonfire." in overlay.transcript.toPlainText()
+    assert "Lit the bonfire." not in overlay.transcript.toPlainText()
 
 
 def test_transcript_is_bounded(overlay):

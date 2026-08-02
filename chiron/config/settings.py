@@ -244,6 +244,12 @@ class OverlaySettings(BaseModel):
         font_size (int): Base point size for the transcript.
         always_on_top (bool): Keep the overlay above other windows.
         start_hidden (bool): Launch to the hotkey rather than to a visible panel.
+        journal_open (bool): Whether the journal drawer is showing. Runtime state
+            the *overlay* owns rather than the settings form — it is persisted
+            here so an evening opens the way the last one closed.
+        journal_width (int): Width of the drawer column in pixels. `width` is
+            measured without it, so opening the drawer widens the window rather
+            than narrowing the transcript.
     """
 
     width: int = Field(default=420, ge=280, le=1600)
@@ -254,6 +260,8 @@ class OverlaySettings(BaseModel):
     font_size: int = Field(default=11, ge=7, le=24)
     always_on_top: bool = True
     start_hidden: bool = False
+    journal_open: bool = False
+    journal_width: int = Field(default=240, ge=140, le=600)
 
 
 class HotkeySettings(BaseModel):
@@ -273,6 +281,10 @@ class HotkeySettings(BaseModel):
         toggle_watching (str): Start watching if stopped, stop it if watching.
         start_watching (str): Start watching; does nothing if already watching.
         stop_watching (str): Stop watching; does nothing if already stopped.
+        toggle_journal (str): Open or close the journal drawer. Global rather
+            than a plain shortcut because the panel is usually not focused —
+            the point of the drawer is to check what Chiron has written down
+            without leaving the game.
     """
 
     toggle_overlay: str = "ctrl+alt+c"
@@ -280,6 +292,7 @@ class HotkeySettings(BaseModel):
     toggle_watching: str = "ctrl+alt+w"
     start_watching: str = ""
     stop_watching: str = ""
+    toggle_journal: str = "ctrl+alt+j"
 
 
 class Settings(BaseModel):

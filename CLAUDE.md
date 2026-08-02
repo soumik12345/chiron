@@ -23,6 +23,7 @@ uv run pytest tests/test_capture.py -q     # one file
 uv run pytest tests/test_novelty.py -q     # observer trigger + novelty detector
 uv run pytest tests/test_sessions.py -q    # session store, index, recorder, viewer render
 uv run pytest tests/test_compaction.py -q  # both modes' compaction + live cost estimation
+uv run pytest tests/test_journal_drawer.py -q  # journal column, unread count, drawer geometry
 uv run pytest tests/test_ui.py::test_watch_button_shows_state_and_asks_for_the_other_one  # one test
 uv run ruff check chiron/ tests/
 uv run ruff format chiron/ tests/
@@ -127,9 +128,21 @@ Session errors are split into permanent vs. transient (`is_permanent_error()` in
 
 Changing `journal.strategy` at runtime requires tearing down and rebuilding the writer (`ChironApp._restart_session(rebuild_writer=True)`), since the two live strategies install different things into the Live session config (function declarations vs. nothing). A mode swap forces the same rebuild.
 
-### The overlay is a three-view stack, not a transcript
+### The overlay is a two-view stack plus a drawer, not a transcript
 
-`chiron/ui/overlay.py` holds a `QStackedWidget` with three pages — `PLAY_VIEW` (today's transcript), `HISTORY_VIEW` and `SESSION_VIEW` (both in `chiron/ui/history_view.py`). Navigation is a small back-stack: `overlay.back()` walks one step, `Escape` calls it and only hides the panel once already on play, and `start_response()` snaps to play so an answer arriving mid-browse is never missed. Entering a review view temporarily enlarges the panel and stores the play size in `_play_size`; `current_geometry()` reports the *play* size while that is set, so opening history once cannot permanently resize the thing floating over the game.
+`chiron/ui/overlay.py` holds a `QStackedWidget` with two pages — `PLAY_VIEW` (today's transcript) and `SESSION_VIEW` (one recorded session read back, in `chiron/ui/history_view.py`). Getting *to* a session is not a page: `SessionPicker` is a `Qt.Popup` that drops under the 🕘 button, so choosing an evening costs no panel resize. Navigation is a small back-stack: `overlay.back()` walks one step, `Escape` calls it and only hides the panel once already on play, and `start_response()` snaps to play so an answer arriving mid-browse is never missed. Managing a session (rename, delete, delete-thumbnails) lives in the viewer's `⋯` menu — on the thing you are looking at, not on a row you are skimming — and the three signals still surface on `OverlayWindow` unchanged, so `app.py`'s wiring did not move.
+
+**Two independent things resize the window, and neither may reach the saved width.** Entering the viewer temporarily enlarges the panel and stores the pre-review size in `_play_size`; opening the journal drawer widens it by `journal_width + BODY_SPACING`. `current_geometry()` undoes both — it reports `_play_size` when set, minus `_journal_offset()` — so `OverlaySettings.width` always means the un-drawered play width. Anything that changes the drawer while `_play_size` is set must move `_play_size` by the same delta, or closing the drawer mid-review reopens a gap on the way back to play.
+
+### The journal is a column, and a closed column still counts
+
+Journal entries used to be dimmed `✎` lines inline in the transcript. They now live in `chiron/ui/journal_drawer.py`'s `JournalDrawer`, a collapsible right-hand column, newest first, category-coloured via `JOURNAL_CATEGORY_COLOURS` (an unrecognised category falls back to dim text rather than being dropped — categories are a hint to the model, not a schema). Rendering is pure like `chiron/sessions/render.py`: `render_entries()` takes entries and returns HTML, assertable with no display.
+
+The column is a *surface* — raised background, border, radius — not a `border-left` hairline; the first version was the hairline, and it read as leftover space with text floating in it. Two QTextDocument quirks are load-bearing in the render and will look like sloppy spacing if undone: a paragraph's bottom margin is dropped before a following `<table>`, so entries are separated by a blank `GAP_POINTS` paragraph rather than a margin, and `font-size` on a `<p>` is unreliable (which is why the empty state carries no scaled-up watermark glyph). A plain `QWidget` also paints no stylesheet background or border without `WA_StyledBackground`.
+
+The drawer sits *outside* the view stack, which is what lets it stay open while a recorded session is read. Moving the entries out of the transcript removes the only signal that the journal was being written, so the toggle carries an unread count (`✎ 3`) that clears on open — `_refresh_journal_button()` also has to `unpolish`/`polish` the button, since Qt does not re-evaluate the `[unread="true"]` property selector on its own.
+
+Two things are easy to get wrong here. `ChironApp._on_active_window` appends to the log *directly* rather than through `JournalWriter.record()`, so it is the one entry `on_entry` never sees — it is handed to the drawer by hand, or the drawer's count and the footer's `journal: N` disagree. And the drawer's open state is runtime state the *overlay* owns, persisted in `OverlaySettings.journal_open`: `SettingsWindow.collect()` builds a fresh `Settings` with no field for it, so `ChironApp.apply_settings()` copies it (and `journal_width`) off the previous object exactly as it does `position_x`/`position_y`, or saving settings would quietly close the drawer.
 
 Rendering a recorded session is pure: `chiron/sessions/render.py` turns events into HTML with thumbnails inline (`<img src="…">` at absolute paths), so the viewer's whole output is assertable without a display. A thumbnail that has been deleted to reclaim disk renders as a dim placeholder, never a broken image.
 
