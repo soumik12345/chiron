@@ -208,32 +208,3 @@ uv run python -m chiron
 ```
 
 Use `uv run chiron --help` for the complete list.
-
-## Development
-
-The test suite does not require a network connection or a display:
-
-```bash
-uv run pytest
-uv run ruff check chiron/ tests/
-uv run ruff format --check chiron/ tests/
-```
-
-The application uses one `qasync` event loop for Qt and asyncio. Screen capture
-is the only worker thread; it hands encoded frames back through Qt signals.
-
-```text
-chiron/
-├── app.py          # application lifecycle and component wiring
-├── capture/        # screenshots, encoding, and fixed scheduling
-├── config/         # settings model and persistence
-├── journal/        # one journal write path and read-only snapshots
-├── observer/       # silent Gemini Live Observer
-├── responder/      # fixed-horizon and ReAct answers
-├── live/           # Observer cost estimation
-├── nonlive/        # shared request-context compaction helpers
-├── sessions/       # durable gameplay events, thumbnails, and index
-├── ui/             # overlay, settings, hotkeys, and theme
-├── core/           # ReAct harness adapted by Chiron-Responder
-└── models/         # model catalogue, calls, pricing, and usage
-```
