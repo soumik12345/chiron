@@ -17,6 +17,11 @@ Unknown keys in an existing file are ignored and missing ones fall back to
 defaults, so a settings file written by an older build still opens; a file that
 is outright unparseable is reported and replaced by defaults rather than being
 allowed to stop the app from starting.
+
+Chiron v3 always has two agents. ``observer_model`` names the required Gemini
+Live observer and ``responder_model`` names an ordinary Google AI Studio or
+OpenRouter completion model. Older selected-model settings are accepted by the
+pre-validator, but only the dual-agent shape is written back to disk.
 """
 
 from __future__ import annotations
@@ -29,14 +34,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 logger = logging.getLogger(__name__)
 
-#: The Live API model the overlay talks to. Every Live model still served is a
-#: native-audio one — the text-out half-cascade models were retired — so Chiron
-#: takes the model's speech and renders its own transcription as text.
+#: Prefix marking a Live API selection. Not a litellm route — the Live API is a
+#: websocket the ``google-genai`` SDK opens, not a completions endpoint — so this
+#: is the one selection id that never reaches litellm.
+LIVE_PREFIX = "live/"
+
+#: The Live API model Chiron-Observer talks to. It is native-audio, but Observer
+#: audio and content are discarded; only journal tool calls cross the boundary.
 DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
+
+#: Provider-qualified defaults for the two v3 agents.
+DEFAULT_OBSERVER_MODEL = LIVE_PREFIX + DEFAULT_LIVE_MODEL
+DEFAULT_RESPONDER_MODEL = "gemini/gemini-3.6-flash"
 
 #: Known Live API model ids, offered in the settings page combo box. The field is
 #: editable, so a newer id can always be typed in.
@@ -46,61 +59,62 @@ LIVE_MODEL_CHOICES: list[str] = [
     "gemini-2.5-flash-native-audio-preview-12-2025",
 ]
 
-#: Context window of the native-audio Live models, used for the "how far back can
-#: it see" estimate on the capture page.
-LIVE_CONTEXT_TOKENS = 128_000
-
-#: litellm id for the sidecar summariser — a regular (non-Live) chat model.
-DEFAULT_SIDECAR_MODEL = "gemini/gemini-3.6-flash"
-
-SIDECAR_MODEL_CHOICES: list[str] = [
-    "gemini/gemini-3.6-flash",
-    "gemini/gemini-2.5-flash",
-    "gemini/gemini-2.5-flash-lite",
-]
-
 #: Environment variables consulted, in order, when no key is saved.
 API_KEY_ENV_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
-JournalStrategy = Literal["tool_call", "sidecar"]
+#: Environment variable consulted when no OpenRouter key is saved.
+OPENROUTER_API_KEY_ENV_VARS = ("OPENROUTER_API_KEY",)
+
 MediaResolution = Literal["low", "medium", "high"]
+ResponderMode = Literal["fixed_horizon", "react"]
+QuestionFramePolicy = Literal["latest", "immediate"]
+
+
+def is_live_selection(selection: str) -> bool:
+    """Whether a provider-qualified selection names a Live API model."""
+    return (selection or "").strip().startswith(LIVE_PREFIX)
+
+
+def live_model_id(selection: str) -> str:
+    """The bare Live API model id inside a ``live/…`` selection.
+
+    A non-live selection has no live model in it, so the default is returned
+    rather than a nonsense id — the caller is asking what to connect with, and
+    "nothing" is not an answer the websocket accepts.
+    """
+    text = (selection or "").strip()
+    if text.startswith(LIVE_PREFIX):
+        return text[len(LIVE_PREFIX) :] or DEFAULT_LIVE_MODEL
+    return DEFAULT_LIVE_MODEL
 
 
 class CaptureSettings(BaseModel):
-    """Screen capture and the adaptive shutter.
+    """Fixed-interval screen capture shared by both agents.
 
     Attributes:
         monitor_index (int): ``mss`` monitor number. 0 is the virtual "all
             monitors" screen; 1 is the primary display.
-        baseline_interval_seconds (float): Seconds between keepalive frames when
-            nothing in particular is happening.
-        burst_interval_seconds (float): Seconds between frames while bursting.
-            1.0 is the API ceiling of 1 fps.
-        burst_duration_seconds (float): How long a burst lasts once triggered.
+        interval_seconds (float): Seconds between scheduled Observer frames.
+            Gemini Live accepts at most one video frame per second.
+        question_frame_policy (QuestionFramePolicy): Reuse the latest scheduled
+            frame, or capture exactly one new frame for a question.
         frame_width (int): Frames are downscaled to this width before encoding.
         jpeg_quality (int): JPEG quality (1-95) for encoded frames.
         stamp_timestamp (bool): Draw the capture time into the frame's corner so
             the model has an explicit "now" to reason about.
-        scene_change_enabled (bool): Trigger a burst when a cheap pixel diff sees
-            the screen change hard (loading screen, new area, death screen).
-        scene_change_threshold (float): Normalised 0-1 difference between two
-            frame signatures above which a scene change is declared.
-        media_resolution (MediaResolution): Token budget the API spends per
-            frame. ``low`` is roughly 260 tokens per frame.
+        media_resolution (MediaResolution): Gemini Live's Observer-side visual
+            token budget. It is independent of ``frame_width`` in v3.
         watch_on_launch (bool): Begin watching the moment Chiron starts. Off by
             default: a screen recorder that switches itself on when you log in is
             not something anyone should have to opt out of.
     """
 
     monitor_index: int = 1
-    baseline_interval_seconds: float = Field(default=4.0, ge=0.5, le=60.0)
-    burst_interval_seconds: float = Field(default=1.0, ge=1.0, le=10.0)
-    burst_duration_seconds: float = Field(default=15.0, ge=1.0, le=120.0)
+    interval_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    question_frame_policy: QuestionFramePolicy = "latest"
     frame_width: int = Field(default=768, ge=256, le=1920)
     jpeg_quality: int = Field(default=60, ge=10, le=95)
     stamp_timestamp: bool = True
-    scene_change_enabled: bool = True
-    scene_change_threshold: float = Field(default=0.12, ge=0.01, le=1.0)
     media_resolution: MediaResolution = "low"
     watch_on_launch: bool = False
 
@@ -114,34 +128,9 @@ class CaptureSettings(BaseModel):
         Returns:
             float: Estimated tokens per minute of ambient capture.
         """
-        if self.baseline_interval_seconds <= 0:
+        if self.interval_seconds <= 0:
             return 0.0
-        return (60.0 / self.baseline_interval_seconds) * tokens_per_frame
-
-
-class JournalSettings(BaseModel):
-    """How meaning is moved out of the frames before they are evicted.
-
-    Attributes:
-        strategy (JournalStrategy): ``tool_call`` gives the live model a
-            ``record_event`` function to call; ``sidecar`` summarises the recent
-            transcript with a separate cheap model on a timer.
-        sidecar_model (str): litellm model id used by the sidecar summariser.
-        sidecar_interval_seconds (float): How often the sidecar runs.
-        sidecar_frame_count (int): How many recent frames the sidecar is shown.
-        fold_interval_seconds (float): How often the recent journal is folded
-            back into the live session as text.
-        fold_entry_limit (int): Maximum journal entries included in one fold.
-        max_entries (int): Entries kept in memory before the oldest are dropped.
-    """
-
-    strategy: JournalStrategy = "tool_call"
-    sidecar_model: str = DEFAULT_SIDECAR_MODEL
-    sidecar_interval_seconds: float = Field(default=180.0, ge=30.0, le=1800.0)
-    sidecar_frame_count: int = Field(default=3, ge=0, le=8)
-    fold_interval_seconds: float = Field(default=120.0, ge=30.0, le=900.0)
-    fold_entry_limit: int = Field(default=40, ge=1, le=200)
-    max_entries: int = Field(default=500, ge=10, le=5000)
+        return (60.0 / self.interval_seconds) * tokens_per_frame
 
 
 class OverlaySettings(BaseModel):
@@ -156,6 +145,12 @@ class OverlaySettings(BaseModel):
         font_size (int): Base point size for the transcript.
         always_on_top (bool): Keep the overlay above other windows.
         start_hidden (bool): Launch to the hotkey rather than to a visible panel.
+        journal_open (bool): Whether the journal drawer is showing. Runtime state
+            the *overlay* owns rather than the settings form — it is persisted
+            here so an evening opens the way the last one closed.
+        journal_width (int): Width of the drawer column in pixels. `width` is
+            measured without it, so opening the drawer widens the window rather
+            than narrowing the transcript.
     """
 
     width: int = Field(default=420, ge=280, le=1600)
@@ -166,6 +161,8 @@ class OverlaySettings(BaseModel):
     font_size: int = Field(default=11, ge=7, le=24)
     always_on_top: bool = True
     start_hidden: bool = False
+    journal_open: bool = False
+    journal_width: int = Field(default=240, ge=140, le=600)
 
 
 class HotkeySettings(BaseModel):
@@ -185,6 +182,10 @@ class HotkeySettings(BaseModel):
         toggle_watching (str): Start watching if stopped, stop it if watching.
         start_watching (str): Start watching; does nothing if already watching.
         stop_watching (str): Stop watching; does nothing if already stopped.
+        toggle_journal (str): Open or close the journal drawer. Global rather
+            than a plain shortcut because the panel is usually not focused —
+            the point of the drawer is to check what Chiron has written down
+            without leaving the game.
     """
 
     toggle_overlay: str = "ctrl+alt+c"
@@ -192,35 +193,130 @@ class HotkeySettings(BaseModel):
     toggle_watching: str = "ctrl+alt+w"
     start_watching: str = ""
     stop_watching: str = ""
+    toggle_journal: str = "ctrl+alt+j"
 
 
 class Settings(BaseModel):
     """The whole of Chiron's user-editable configuration.
 
     Attributes:
-        api_key (str): Gemini API key. Empty means "look in the environment".
-        live_model (str): Live API model id.
+        api_key (str): Gemini API key, shared by the Live API and Google AI
+            Studio. Empty means "look in the environment".
+        openrouter_api_key (str): OpenRouter key. Empty means the environment,
+            and no key at all means OpenRouter is simply absent from the picker.
+        observer_model (str): Provider-qualified Gemini Live model used only by
+            Chiron-Observer.
+        responder_model (str): Non-live Google or OpenRouter model used only by
+            Chiron-Responder.
+        responder_mode (ResponderMode): Fixed-horizon or ReAct execution.
         game_name (str): Optional name of the game being played, folded into the
             system instruction so the model knows what it is looking at.
-        extra_system_prompt (str): Free-form additions to the system instruction.
+        observer_system_prompt (str): Optional additions to Observer behavior.
+        responder_system_prompt (str): Optional additions to Responder behavior.
         capture (CaptureSettings): Screen capture configuration.
-        journal (JournalSettings): Journal strategy and cadence.
         overlay (OverlaySettings): Overlay appearance.
         hotkeys (HotkeySettings): Global shortcuts.
     """
 
     api_key: str = ""
-    live_model: str = DEFAULT_LIVE_MODEL
+    openrouter_api_key: str = ""
+    observer_model: str = DEFAULT_OBSERVER_MODEL
+    responder_model: str = DEFAULT_RESPONDER_MODEL
+    responder_mode: ResponderMode = "fixed_horizon"
     game_name: str = ""
-    extra_system_prompt: str = ""
+    observer_system_prompt: str = ""
+    responder_system_prompt: str = ""
 
     capture: CaptureSettings = Field(default_factory=CaptureSettings)
-    journal: JournalSettings = Field(default_factory=JournalSettings)
     overlay: OverlaySettings = Field(default_factory=OverlaySettings)
     hotkeys: HotkeySettings = Field(default_factory=HotkeySettings)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_dual_agents(cls, data: Any) -> Any:
+        """Accept v0-v2 settings and emit one unambiguous in-memory v3 shape."""
+        if not isinstance(data, dict):
+            return data
+        migrated = dict(data)
+
+        selected = str(migrated.get("selected_model") or "").strip()
+        legacy_live = str(migrated.get("live_model") or "").strip()
+        is_legacy = bool(selected or legacy_live)
+        if not selected and legacy_live:
+            selected = (
+                legacy_live
+                if is_live_selection(legacy_live)
+                else LIVE_PREFIX + legacy_live
+            )
+        if selected:
+            if is_live_selection(selected):
+                migrated["observer_model"] = selected
+                migrated.setdefault("responder_model", DEFAULT_RESPONDER_MODEL)
+            else:
+                migrated["observer_model"] = DEFAULT_OBSERVER_MODEL
+                migrated["responder_model"] = selected
+        else:
+            observer = str(migrated.get("observer_model") or "").strip()
+            responder = str(migrated.get("responder_model") or "").strip()
+            if observer and "/" not in observer:
+                observer = LIVE_PREFIX + observer
+            migrated["observer_model"] = observer or DEFAULT_OBSERVER_MODEL
+            migrated["responder_model"] = responder or DEFAULT_RESPONDER_MODEL
+
+        # v2 used ``observer_model`` for a split request/response observer. The
+        # presence of the old selected-model switch disambiguates that shape;
+        # the value was intentionally ignored above unless it was the selection.
+        if is_legacy and not is_live_selection(selected):
+            migrated["observer_model"] = DEFAULT_OBSERVER_MODEL
+
+        capture = migrated.get("capture")
+        if isinstance(capture, dict):
+            capture = dict(capture)
+            if "interval_seconds" not in capture:
+                baseline = capture.get("baseline_interval_seconds")
+                try:
+                    value = float(baseline)
+                except (TypeError, ValueError):
+                    value = 5.0
+                capture["interval_seconds"] = value if 1.0 <= value <= 60.0 else 5.0
+            for name in (
+                "baseline_interval_seconds",
+                "burst_interval_seconds",
+                "burst_duration_seconds",
+                "scene_change_enabled",
+                "scene_change_threshold",
+            ):
+                capture.pop(name, None)
+            migrated["capture"] = capture
+
+        migrated.pop("journal", None)
+        migrated.pop("agent_mode", None)
+        migrated.pop("observer", None)
+        migrated.pop("selected_model", None)
+        migrated.pop("live_model", None)
+
+        old_prompt = str(migrated.get("extra_system_prompt") or "")
+        if old_prompt:
+            migrated.setdefault("observer_system_prompt", old_prompt)
+            migrated.setdefault("responder_system_prompt", old_prompt)
+        return migrated
+
+    @model_validator(mode="after")
+    def _validate_agent_models(self) -> Settings:
+        """Keep the two provider roles structurally disjoint."""
+        if not is_live_selection(self.observer_model):
+            raise ValueError("observer_model must be a live/<gemini-model> id")
+        responder = self.responder_model.strip()
+        if not responder.startswith(("gemini/", "openrouter/")):
+            raise ValueError(
+                "responder_model must use the gemini/ or openrouter/ provider"
+            )
+        return self
+
+    # ------------------------------------------------------------ credentials
+
     def resolved_api_key(self) -> str:
-        """The key to authenticate with: the saved one, else the environment."""
+        """The Google key to authenticate with: the saved one, else the env."""
         if self.api_key.strip():
             return self.api_key.strip()
         for name in API_KEY_ENV_VARS:
@@ -239,31 +335,67 @@ class Settings(BaseModel):
                 return name
         return "none"
 
+    def resolved_openrouter_key(self) -> str:
+        """The OpenRouter key: the saved one, else ``OPENROUTER_API_KEY``."""
+        if self.openrouter_api_key.strip():
+            return self.openrouter_api_key.strip()
+        for name in OPENROUTER_API_KEY_ENV_VARS:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return value
+        return ""
+
+    def key_for_model(self, model_id: str) -> str:
+        """The credential a given model id authenticates with.
+
+        Args:
+            model_id (str): A selection or litellm id.
+
+        Returns:
+            str: The matching key, or empty — which leaves litellm to find one
+                in the environment, exactly as it did before this existed.
+        """
+        if (model_id or "").startswith("openrouter/"):
+            return self.resolved_openrouter_key()
+        return self.resolved_api_key()
+
+    # --------------------------------------------------------------- capture
+
+    def effective_frame_width(self) -> int:
+        """The one capture width delivered to both v3 agents."""
+        return self.capture.frame_width
+
+    def effective_capture(self) -> CaptureSettings:
+        """Capture settings as the capture thread should actually run them."""
+        capture = self.capture.model_copy()
+        capture.frame_width = self.effective_frame_width()
+        return capture
+
+    # ---------------------------------------------------------------- change
+
     def copy_deep(self) -> Settings:
         """An independent copy, for editing in the settings window."""
         return Settings.model_validate(self.model_dump())
 
-    def requires_session_restart(self, other: Settings) -> bool:
-        """Whether moving from `self` to `other` invalidates the live session.
-
-        Model id, credential, system instruction and journal strategy are all
-        baked into the websocket's setup message, so changing any of them means
-        the current session has to be rotated rather than merely reconfigured.
-
-        Args:
-            other (Settings): The settings about to be applied.
-
-        Returns:
-            bool: True when the session must be restarted for the change to take
-                effect.
-        """
+    def requires_observer_reconnect(self, other: Settings) -> bool:
+        """Whether Observer websocket configuration changed."""
         return (
-            self.live_model != other.live_model
+            self.observer_model != other.observer_model
             or self.resolved_api_key() != other.resolved_api_key()
             or self.game_name != other.game_name
-            or self.extra_system_prompt != other.extra_system_prompt
-            or self.journal.strategy != other.journal.strategy
+            or self.observer_system_prompt != other.observer_system_prompt
             or self.capture.media_resolution != other.capture.media_resolution
+        )
+
+    def requires_responder_rebuild(self, other: Settings) -> bool:
+        """Whether the Responder adapter must be rebuilt, preserving memory."""
+        return (
+            self.responder_model != other.responder_model
+            or self.responder_mode != other.responder_mode
+            or self.key_for_model(self.responder_model)
+            != other.key_for_model(other.responder_model)
+            or self.game_name != other.game_name
+            or self.responder_system_prompt != other.responder_system_prompt
         )
 
 
@@ -394,7 +526,10 @@ def plan_removal(path: str | Path | None = None) -> RemovalPlan:
         plan.settings_file = target
         try:
             raw = json.loads(target.read_text(encoding="utf-8"))
-            plan.holds_api_key = bool(str(raw.get("api_key", "")).strip())
+            plan.holds_api_key = any(
+                str(raw.get(name, "")).strip()
+                for name in ("api_key", "openrouter_api_key")
+            )
         except (OSError, json.JSONDecodeError, AttributeError):
             plan.holds_api_key = False
 
@@ -445,20 +580,24 @@ def remove_configuration(path: str | Path | None = None) -> RemovalPlan:
 __all__ = [
     "API_KEY_ENV_VARS",
     "DEFAULT_LIVE_MODEL",
-    "DEFAULT_SIDECAR_MODEL",
+    "DEFAULT_OBSERVER_MODEL",
+    "DEFAULT_RESPONDER_MODEL",
     "LIVE_MODEL_CHOICES",
-    "SIDECAR_MODEL_CHOICES",
+    "LIVE_PREFIX",
+    "OPENROUTER_API_KEY_ENV_VARS",
     "CaptureSettings",
     "HotkeySettings",
-    "JournalSettings",
-    "JournalStrategy",
-    "RemovalPlan",
-    "plan_removal",
-    "remove_configuration",
     "MediaResolution",
     "OverlaySettings",
+    "QuestionFramePolicy",
+    "RemovalPlan",
+    "ResponderMode",
     "Settings",
     "default_settings_path",
+    "is_live_selection",
+    "live_model_id",
     "load_settings",
+    "plan_removal",
+    "remove_configuration",
     "save_settings",
 ]

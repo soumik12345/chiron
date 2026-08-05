@@ -32,10 +32,31 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field
 
 #: Why a call was made. `turn` is the agent loop asking the model what to do next;
-#: `compaction` is :class:`~chiron.core.context.ContextCompactor` summarising history
-#: to stay inside the context window. Compaction spend is invisible in a cumulative
-#: total but is real money, so it gets its own kind rather than being folded into turns.
-LLMCallKind = Literal["turn", "compaction"]
+#: `compaction` is history being summarised to stay inside the context window, in
+#: either :class:`~chiron.core.context.ContextCompactor` or the non-live provider.
+#: Compaction spend is invisible in a cumulative total but is real money, so it gets
+#: its own kind rather than being folded into turns.
+#:
+#: The overlay's own kinds are here too, and their absence used to be a live bug: the
+#: app passed `nonlive_qa` and `journal_sidecar` into a two-value Literal, so every
+#: record raised on construction and died inside the `try/except` that wraps usage
+#: accounting. Nothing was ever written, and nothing said so. A closed vocabulary is
+#: still worth keeping — it is what stops a typo becoming a cost category nobody
+#: reads — but it has to actually contain the kinds the application emits.
+LLMCallKind = Literal[
+    "turn",
+    "compaction",
+    "nonlive_qa",
+    "nonlive_observer",
+    "journal_sidecar",
+    "live_turn",
+    "fixed_answer",
+    "react_step",
+    "responder_compaction",
+    "journal_compaction",
+    "observer_checkpoint",
+    "observer_context",
+]
 
 #: `ok` billed normally. `retry` is an attempt that failed transiently and *was*
 #: re-issued; `error` is one that failed terminally. Failed attempts usually carry no
@@ -50,8 +71,20 @@ LLMCallStatus = Literal["ok", "retry", "error"]
 #: (:func:`~chiron.models.pricing.litellm_pricing`); `actual` means
 #: the route reported its real charge and no estimate was needed; `unpriced` means
 #: nothing could price it.
+#:
+#: `estimated` is the odd one out and deliberately distinct: the Live API never
+#: reports usage in a shape chiron can bill from, so Observer rows are arithmetic
+#: — frames, checkpoint/context text, and discarded audio duration — rather than
+#: measurement. Every surface that renders a total checks for this and prefixes a
+#: `~`, because a number derived from a token estimate and a number a provider
+#: charged should never look alike.
 PricingSource = Literal[
-    "openrouter_live", "google_static", "litellm_static", "actual", "unpriced"
+    "openrouter_live",
+    "google_static",
+    "litellm_static",
+    "actual",
+    "estimated",
+    "unpriced",
 ]
 
 #: Where a finished record goes. Sync by design: it is called from
@@ -252,6 +285,9 @@ class LLMCallRecord(BaseModel):
     Attributes:
         id (str): Unique id for this row.
         run_id (str | None): Groups every call made by one agent run.
+        session_id (str | None): The gameplay session this call belongs to, so a
+            row can be attributed to an evening of play after the fact. Set by
+            whoever installs the sink, through `usage_labels`.
         book_id (str | None): The book being processed, when the run has one.
         agent_id (str | None): The settings-registry agent id (e.g. `ebook_loader`).
         kind (LLMCallKind): Whether this was an agent turn or a compaction summary.
@@ -286,6 +322,7 @@ class LLMCallRecord(BaseModel):
 
     id: str = Field(default_factory=new_call_id)
     run_id: str | None = None
+    session_id: str | None = None
     book_id: str | None = None
     agent_id: str | None = None
 

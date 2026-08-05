@@ -1,9 +1,9 @@
 """The game journal: timestamped text that outlives the frames it came from.
 
-The live model's visual memory is structurally a few minutes long — at any
-capture rate, a 32k context holds only so many frames before the sliding window
-starts evicting them. The journal is how meaning survives that eviction. Text is
-roughly a hundred times cheaper per unit of meaning than pixels, so a line like::
+The live model's visual memory is structurally finite: at any capture rate, its
+context holds only so many frames before the sliding window starts evicting them.
+The journal is how meaning survives that eviction. Text is roughly a hundred
+times cheaper per unit of meaning than pixels, so a line like::
 
     12:05 — [death] died to the skeleton on the bridge, lost 2400 souls
 
@@ -14,9 +14,8 @@ it trivial to render into a session as text, trivial to show in the overlay, and
 trivial to persist to SQLite when cross-session memory arrives — none of which
 would be true of a richer structure.
 
-The log tracks which entries have already been folded into the live session, so a
-periodic fold sends only what is new, while a session rotation can replay the
-whole thing as a reconnect seed.
+Fresh Observer connections replay recent entries as compact context, while the
+Responder reads an immutable snapshot of the complete retained journal.
 """
 
 from __future__ import annotations
@@ -48,13 +47,13 @@ class JournalEntry:
         timestamp (float): Unix time the event was recorded.
         note (str): What happened, in one sentence.
         category (str): Loose bucket from :data:`CATEGORIES`.
-        source (str): Which writer produced this — ``tool_call`` or ``sidecar``.
+        source (str): ``observer`` for model writes or ``system`` for app events.
     """
 
     timestamp: float
     note: str
     category: str = "note"
-    source: str = "tool_call"
+    source: str = "observer"
 
     @property
     def clock(self) -> str:
@@ -63,25 +62,21 @@ class JournalEntry:
 
     def render(self) -> str:
         """The entry as one journal line."""
-        return f"{self.clock} — [{self.category}] {self.note}"
+        return f"{self.clock} [{self.category}] {self.note}"
 
 
 @dataclass
 class JournalLog:
     """An in-memory, append-only log of journal entries.
 
-    Both journal writers append here, so the strategy in force is invisible to
-    everything downstream: the overlay renders the same list either way, and the
-    session manager folds the same text.
+    The overlay, recorder, Observer, and Responder all consume the same retained
+    entries through their narrower application-owned seams.
 
     Attributes:
-        max_entries (int): Entries retained before the oldest are dropped.
         entries (list[JournalEntry]): Everything currently held, oldest first.
     """
 
-    max_entries: int = 500
     entries: list[JournalEntry] = field(default_factory=list)
-    _folded_count: int = field(default=0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def append(
@@ -89,7 +84,7 @@ class JournalLog:
         note: str,
         *,
         category: str = "note",
-        source: str = "tool_call",
+        source: str = "observer",
         timestamp: float | None = None,
     ) -> JournalEntry | None:
         """Record one event.
@@ -114,10 +109,6 @@ class JournalLog:
         )
         with self._lock:
             self.entries.append(entry)
-            overflow = len(self.entries) - self.max_entries
-            if overflow > 0:
-                del self.entries[:overflow]
-                self._folded_count = max(0, self._folded_count - overflow)
         return entry
 
     def recent(self, limit: int = 40) -> list[JournalEntry]:
@@ -125,15 +116,10 @@ class JournalLog:
         with self._lock:
             return list(self.entries[-limit:]) if limit > 0 else []
 
-    def unfolded(self) -> list[JournalEntry]:
-        """Entries appended since the last :meth:`mark_folded`."""
+    def snapshot(self) -> list[JournalEntry]:
+        """A lossless copy of every entry in the current gameplay session."""
         with self._lock:
-            return list(self.entries[self._folded_count :])
-
-    def mark_folded(self) -> None:
-        """Record that everything currently held has been sent to the session."""
-        with self._lock:
-            self._folded_count = len(self.entries)
+            return list(self.entries)
 
     def render(self, entries: list[JournalEntry] | None = None) -> str:
         """Render entries as newline-separated journal lines.
@@ -154,7 +140,6 @@ class JournalLog:
         """Drop every entry (used when starting a fresh play session)."""
         with self._lock:
             self.entries.clear()
-            self._folded_count = 0
 
     def __len__(self) -> int:
         """Number of entries currently held."""

@@ -39,6 +39,7 @@ _M = 1_000_000
 #: its standard 75%-off discount rather than 0.0 — a free cache read is a claim, and
 #: the wrong one.
 _PER_MILLION: dict[str, tuple[float, float, float]] = {
+    "gemini-3.6-flash": (1.50, 7.50, 0.15),
     "gemini-3-pro": (2.00, 12.00, 0.20),
     "gemini-2.5-pro": (1.25, 10.00, 0.31),
     "gemini-2.5-flash-lite": (0.10, 0.40, 0.025),

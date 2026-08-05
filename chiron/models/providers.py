@@ -28,6 +28,13 @@ from dataclasses import dataclass
 #: which pydantic needs as a static annotation.
 OPENROUTER = "openrouter"
 GOOGLE = "google"
+#: The Gemini Live API. The odd one out: not a completions endpoint at all, but a
+#: websocket the ``google-genai`` SDK opens, so nothing with this prefix ever
+#: reaches litellm. It is in the registry anyway because the settings page, the
+#: model picker and the credential lookup all want one uniform answer to "which
+#: provider does this id belong to", and a special case outside the registry
+#: would have to be repeated in each of them.
+LIVE = "live"
 
 
 @dataclass(frozen=True)
@@ -39,11 +46,15 @@ class ProviderDefinition:
         name (str): Display name, e.g. "Google AI Studio".
         litellm_prefix (str): The prefix litellm routes on (chironopenrouter/chiron,
             chirongemini/chiron). Also how :func:`provider_for_model` works backwards from a
-            configured model id to the credential it needs.
+            configured model id to the credential it needs. For the Live API,
+            which litellm never sees, this is simply the id prefix.
         api_key_env (str): Environment variable consulted when no key is saved.
         console_url (str): Where a user creates a key.
         key_prefix_hint (str): A placeholder shaped like a real key for that provider.
         blurb (str): One line of orientation for the settings page.
+        is_live (bool): Whether models here run over the Live API rather than a
+            request/response endpoint — the thing that decides which session
+            provider Chiron builds.
     """
 
     id: str
@@ -53,9 +64,21 @@ class ProviderDefinition:
     console_url: str
     key_prefix_hint: str
     blurb: str
+    is_live: bool = False
 
 
 PROVIDERS: list[ProviderDefinition] = [
+    ProviderDefinition(
+        id=LIVE,
+        name="Gemini Live API",
+        litellm_prefix="live/",
+        api_key_env="GEMINI_API_KEY",
+        console_url="https://aistudio.google.com/apikey",
+        key_prefix_hint="AIza…",
+        blurb="A persistent websocket that watches continuously. Ambient "
+        "awareness for free; you pay for every frame either way.",
+        is_live=True,
+    ),
     ProviderDefinition(
         id=OPENROUTER,
         name="OpenRouter",
@@ -142,6 +165,7 @@ def strip_prefix(model_id: str) -> str:
 
 __all__ = [
     "GOOGLE",
+    "LIVE",
     "OPENROUTER",
     "PROVIDERS",
     "PROVIDERS_BY_ID",

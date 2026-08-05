@@ -21,7 +21,7 @@ from chiron.capture.active_window import (
     steam_library_steamapps,
 )
 from chiron.config.settings import Settings
-from chiron.live.prompts import build_system_instruction
+from chiron.observer.prompts import build_observer_instruction
 
 ACF = """\
 "AppState"
@@ -239,20 +239,20 @@ def test_tracker_without_a_resolver_is_inert(qapp):
 
 
 def test_detected_game_reaches_the_instruction():
-    text = build_system_instruction(Settings(), detected_game="Manor Lords (Steam)")
-    assert "appears to be playing: Manor Lords (Steam)" in text
+    text = build_observer_instruction(Settings(), detected_game="Manor Lords (Steam)")
+    assert "focused window suggests: Manor Lords (Steam)" in text
     assert "Trust the frames" in text, "a focused window is evidence, not certainty"
 
 
 def test_the_players_own_game_name_wins():
     settings = Settings(game_name="Elden Ring")
-    text = build_system_instruction(settings, detected_game="Manor Lords (Steam)")
+    text = build_observer_instruction(settings, detected_game="Manor Lords (Steam)")
     assert "The player is playing: Elden Ring." in text
     assert "Manor Lords" not in text
 
 
 def test_no_game_and_no_detection_says_nothing():
-    text = build_system_instruction(Settings())
+    text = build_observer_instruction(Settings())
     assert "playing" not in text.split("How you see the world")[0]
     assert "appears to be playing" not in text
 
@@ -278,9 +278,12 @@ def test_watching_registers_the_detected_game(app):
     _detected(app)
     app.set_watching(True)
 
-    assert app.session.detected_game == "Manor Lords (Steam)"
+    assert app.observer.detected_game == "Manor Lords (Steam)"
+    assert app.responder.detected_game == "Manor Lords (Steam)"
     assert "Manor Lords" in app.journal.render()
-    assert "looks like Manor Lords" in app.overlay.transcript.toPlainText()
+    assert (
+        "Observer connected; capture is active." in app.overlay.transcript.toPlainText()
+    )
 
 
 def test_a_manually_named_game_silences_detection(app):
@@ -288,23 +291,28 @@ def test_a_manually_named_game_silences_detection(app):
     app.settings.game_name = "Elden Ring"
     app.set_watching(True)
 
-    assert getattr(app.session, "detected_game", "") == ""
+    assert app.observer.detected_game == ""
+    assert app.responder.detected_game == ""
     assert "Manor Lords" not in app.journal.render()
-    assert "Watching your screen." in app.overlay.transcript.toPlainText()
+    assert (
+        "Observer connected; capture is active." in app.overlay.transcript.toPlainText()
+    )
 
 
 def test_switching_games_mid_watch_is_journaled(app):
     app.set_watching(True)
     app._on_active_window(WindowInfo(window_id=9, title="Hades", wm_class="supergiant"))
 
-    assert app.session.detected_game == "'Hades' (supergiant)"
+    assert app.observer.detected_game == "'Hades' (supergiant)"
+    assert app.responder.detected_game == "'Hades' (supergiant)"
     assert "switched to 'Hades' (supergiant)" in app.journal.render()
 
 
 def test_switching_windows_while_not_watching_is_not_journaled(app):
     app._on_active_window(WindowInfo(window_id=9, wm_class="firefox"))
     assert len(app.journal) == 0, "browsing before watching is nobody's business"
-    assert app.session.detected_game == "firefox", "still remembered for later"
+    assert app.observer.detected_game == "firefox", "still remembered for later"
+    assert app.responder.detected_game == "firefox"
 
 
 def test_settings_window_shows_the_detection_as_a_placeholder(app):

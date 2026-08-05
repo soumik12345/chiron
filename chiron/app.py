@@ -1,34 +1,15 @@
-"""Chiron's entry point: the wiring that makes the parts one application.
-
-Everything runs on a single event loop. ``qasync`` drives asyncio *inside* Qt's
-loop, so the Live session's coroutines and the overlay's widgets share a thread
-and neither has to marshal calls to the other. The one genuinely concurrent piece
-is screen capture, which lives on its own thread and comes back as Qt signals.
-
-The flow through the app is small enough to state in full:
-
-* the capture thread produces frames, which go to the session (newest wins) and
-  to the journal writer;
-* the player's question bursts the shutter and is sent as text;
-* the model's answer streams back into the overlay;
-* notable events become journal entries — by the model calling ``record_event``
-  or by the sidecar summariser, depending on the setting;
-* every couple of minutes the new journal lines are folded back into the session,
-  so they outlive the frames that produced them;
-* when the session dies, it is reopened and re-seeded from the journal.
-
-Saving settings goes through here too, because only this object knows which
-changes can be applied in place and which need the session rotated.
-"""
+"""Application wiring for Chiron's permanent Observer and Responder agents."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
-import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TextIO
 
@@ -47,137 +28,527 @@ from chiron.config.settings import (
     remove_configuration,
     save_settings,
 )
+from chiron.journal.compaction import JournalCompactor
 from chiron.journal.log import JournalEntry, JournalLog
-from chiron.journal.writers import JournalWriter, build_journal_writer
-from chiron.live.session import LiveSessionManager
+from chiron.journal.service import JournalService
+from chiron.observer.session import ObserverSessionManager
+from chiron.responder.conversation import ResponderConversation
+from chiron.responder.session import ResponderSessionManager
+from chiron.session import ObserverStatus
+from chiron.sessions.recorder import SessionRecorder
 from chiron.ui.hotkeys import GlobalHotkeyManager
-from chiron.ui.overlay import OverlayWindow
+from chiron.ui.overlay import SESSION_VIEW, OverlayWindow
 from chiron.ui.settings_window import SettingsWindow
 
 logger = logging.getLogger(__name__)
 
-#: How often the overlay's footer line is refreshed.
 _FOOTER_INTERVAL_MS = 1000
 
 
-class ChironApp(QObject):
-    """Owns every component and the connections between them.
+@dataclass(frozen=True)
+class _PendingQuestion:
+    text: str
+    immediate: bool
 
-    Attributes:
-        settings (Settings): The configuration currently in force.
-        settings_path (Path): Where settings are persisted.
-        journal (JournalLog): The shared journal.
-        writer (JournalWriter): The active journal strategy.
-        session (LiveSessionManager): The Live API connection.
-        capture (CaptureService): The screen capture thread.
-        overlay (OverlayWindow): The floating chat panel.
-    """
+
+class ChironApp(QObject):
+    """Own both agents and every cross-component connection."""
 
     def __init__(
         self,
         settings: Settings,
         settings_path: Path,
         parent: QObject | None = None,
+        *,
+        sessions_root: Path | None = None,
     ) -> None:
-        """Build every component and wire them together."""
         super().__init__(parent)
         self.settings = settings
         self.settings_path = settings_path
         self.quit_requested = asyncio.Event()
+        self._watch_requested = False
         self._warned_not_watching = False
+        self._latest_frame: Frame | None = None
+        self._questions: deque[_PendingQuestion] = deque()
+        self._waiting_immediate: tuple[int, _PendingQuestion] | None = None
+        self._question_token = 0
 
-        self.journal = JournalLog(max_entries=settings.journal.max_entries)
-        self.writer: JournalWriter = self._build_writer()
-        self.session = LiveSessionManager(settings, self.journal, self.writer, self)
-        self.capture = CaptureService(settings.capture, self)
+        self.recorder = SessionRecorder(sessions_root, self)
+        self.journal = JournalLog()
+        self.journal_service = JournalService(self.journal, self._on_journal_entry)
+        self.journal_compactor = JournalCompactor(
+            settings, self.journal_service, parent=self
+        )
+        self.conversation = ResponderConversation()
+        self.observer = ObserverSessionManager(
+            settings,
+            self.journal_service,
+            self.journal_compactor,
+            parent=self,
+        )
+        self.responder = ResponderSessionManager(
+            settings,
+            self.journal_service.reader(),
+            self.conversation,
+            self.journal_compactor,
+            parent=self,
+        )
+        self.capture = CaptureService(settings.effective_capture(), self)
         self.overlay = OverlayWindow(settings.overlay)
         self.settings_window: SettingsWindow | None = None
         self.hotkeys = GlobalHotkeyManager(self)
         self.window_tracker = ActiveWindowTracker(self._chiron_window_ids, self)
 
-        self.fold_timer = QTimer(self)
-        self.fold_timer.setInterval(int(settings.journal.fold_interval_seconds * 1000))
-        self.fold_timer.timeout.connect(lambda: self.session.fold_journal())
-
         self.footer_timer = QTimer(self)
         self.footer_timer.setInterval(_FOOTER_INTERVAL_MS)
         self.footer_timer.timeout.connect(self._refresh_footer)
-
         self._connect()
 
     # --------------------------------------------------------------- wiring
 
-    def _build_writer(self) -> JournalWriter:
-        """Create the journal writer named by the current settings."""
-        return build_journal_writer(
-            self.settings.journal,
-            self.journal,
-            api_key=self.settings.resolved_api_key(),
-            on_entry=self._on_journal_entry,
-        )
-
     def _connect(self) -> None:
-        """Connect every signal to its handler."""
         self.overlay.promptSubmitted.connect(self._on_prompt)
         self.overlay.settingsRequested.connect(self.show_settings)
         self.overlay.panelHidden.connect(self._remember_geometry)
         self.overlay.quitRequested.connect(self.request_quit)
         self.overlay.watchToggled.connect(self.set_watching)
+        self.overlay.newSessionRequested.connect(self.new_session)
+        self.overlay.historyRequested.connect(self.show_history)
+        self.overlay.sessionOpened.connect(self.open_session)
+        self.overlay.sessionRenamed.connect(self._on_session_renamed)
+        self.overlay.sessionDeleted.connect(self._on_session_deleted)
+        self.overlay.sessionThumbnailsDeleted.connect(self._on_thumbnails_deleted)
 
-        self.capture.frameCaptured.connect(self._on_frame)
-        self.capture.sceneChanged.connect(self._on_scene_change)
+        self.recorder.sessionChanged.connect(self.overlay.set_session)
+        self.recorder.sessionChanged.connect(self._on_session_changed)
+        self.recorder.costChanged.connect(self.overlay.set_cost)
+        self.journal_compactor.llmCall.connect(self.recorder.record_llm_call)
+        self.journal_compactor.compacted.connect(self._on_compacted)
+
+        self.capture.frameCaptured.connect(self._on_scheduled_frame)
+        self.capture.immediateFrameCaptured.connect(self._on_immediate_frame)
         self.capture.errorOccurred.connect(self._on_capture_error)
 
-        self.session.statusChanged.connect(self.overlay.set_status)
-        self.session.responseStarted.connect(self.overlay.start_response)
-        self.session.responseDelta.connect(self.overlay.append_delta)
-        self.session.responseCompleted.connect(self.overlay.end_response)
-        self.session.errorOccurred.connect(self._on_session_error)
-
+        self._connect_observer()
+        self._connect_responder()
         self.window_tracker.windowChanged.connect(self._on_active_window)
-
         self.hotkeys.activated.connect(self._on_hotkey)
         self.hotkeys.failed.connect(
             lambda message: self.overlay.append_system(f"⚠ {message}")
         )
 
+    def _connect_observer(self) -> None:
+        self.observer.statusChanged.connect(self._on_observer_status)
+        self.observer.errorOccurred.connect(self._on_observer_error)
+        self.observer.errorOccurred.connect(
+            lambda detail: self.recorder.record_status(
+                "error", detail, agent_id="observer"
+            )
+        )
+        self.observer.statusChanged.connect(
+            lambda state, detail: self.recorder.record_status(
+                state, detail, agent_id="observer"
+            )
+        )
+        self.observer.frameSent.connect(
+            lambda frame, reason: self.recorder.record_frame(
+                frame, reason, agent_id="observer"
+            )
+        )
+        self.observer.llmCall.connect(self.recorder.record_llm_call)
+        self.observer.compacted.connect(self._on_compacted)
+
+    def _connect_responder(self) -> None:
+        self.responder.responseStarted.connect(self.overlay.start_response)
+        self.responder.responseDelta.connect(self.overlay.append_delta)
+        self.responder.responseCompleted.connect(self.overlay.end_response)
+        self.responder.responseCompleted.connect(self._on_answer)
+        self.responder.errorOccurred.connect(self._on_responder_error)
+        self.responder.errorOccurred.connect(
+            lambda detail: self.recorder.record_status(
+                "error", detail, agent_id="responder"
+            )
+        )
+        self.responder.llmCall.connect(self.recorder.record_llm_call)
+        self.responder.compacted.connect(self._on_compacted)
+        self.responder.agentTrace.connect(self.recorder.record_agent_trace)
+
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
-        """Show the overlay and arm everything — without looking at the screen.
-
-        Launching Chiron deliberately does not start watching. The capture thread
-        comes up idle and waits to be told, so nothing is read until the player
-        asks for it.
-        """
-        self.overlay.set_status("idle", "")
+        self.overlay.set_status("idle", "Observer is off")
         self.overlay.set_watching(False, self.settings.hotkeys.toggle_watching)
         self.overlay.set_hide_hint(self.settings.hotkeys.toggle_overlay)
         if not self.settings.overlay.start_hidden:
             self.overlay.show_and_focus()
         self.overlay.append_system(
-            f"Chiron is not watching yet. Press "
-            f"{self._watch_hotkey_hint()} to start, "
-            f"{self.settings.hotkeys.toggle_overlay} to show or hide this panel. "
-            f"Run your game borderless-windowed."
+            f"Chiron is not watching yet. Press {self._watch_hotkey_hint()} to "
+            f"start, {self.settings.hotkeys.toggle_overlay} to show or hide this "
+            "panel. Run your game borderless-windowed."
         )
-
         self.hotkeys.set_bindings(self._hotkey_bindings())
         self.hotkeys.start()
         self.window_tracker.start()
         self.capture.start()
-        self.fold_timer.start()
         self.footer_timer.start()
-
         if not self.settings.resolved_api_key():
             self.overlay.append_system(
-                "No Gemini API key configured — open Settings (⚙) to add one."
+                "Google AI Studio key required: the Observer cannot watch without it."
+            )
+        if not self.settings.key_for_model(self.settings.responder_model):
+            self.overlay.append_system(
+                "No API key for the selected Responder model. Open Settings."
             )
         if self.settings.capture.watch_on_launch:
             self.set_watching(True)
 
+    async def shutdown(self) -> None:
+        self.footer_timer.stop()
+        self.hotkeys.stop()
+        self.window_tracker.stop()
+        self.capture.set_watching(False)
+        self.capture.stop()
+        self._remember_geometry()
+        try:
+            save_settings(self.settings, self.settings_path)
+        except OSError as error:
+            logger.warning("Could not save settings on exit: %s", error)
+        await asyncio.gather(
+            self.observer.stop(), self.responder.stop(), return_exceptions=True
+        )
+        self.recorder.shutdown()
+
+    def request_quit(self) -> None:
+        self.quit_requested.set()
+
+    # ------------------------------------------------------- gameplay session
+
+    def ensure_session(self) -> str:
+        game = self.settings.game_name.strip() or self._detected_game_label()
+        session_id = self.recorder.ensure_session(game=game, mode="dual_agent")
+        self.observer.session_id = session_id
+        self.responder.session_id = session_id
+        self.journal_compactor.session_id = session_id
+        return session_id
+
+    def new_session(self) -> None:
+        self.recorder.close_session()
+        if self.watch_requested:
+            self.capture.set_watching(False)
+        self.journal_service.clear()
+        self.conversation.clear()
+        self.responder.reset_memory()
+        self.observer.reset_memory()
+        self.observer.session_id = ""
+        self.responder.session_id = ""
+        self.journal_compactor.session_id = ""
+        self._invalidate_frames()
+        self._questions.clear()
+        self._waiting_immediate = None
+        self.overlay.clear_transcript()
+        self.overlay.clear_journal()
+        self.overlay.show_play()
+        self.overlay.append_system(
+            "New session. Chiron has forgotten the journal and conversation; "
+            "the previous session remains in history."
+        )
+        if self.watch_requested:
+            self.ensure_session()
+            self.recorder.record_watch(True)
+
+    # --------------------------------------------------------------- history
+
+    def show_history(self) -> None:
+        self.overlay.picker.set_sessions(
+            self.recorder.sessions(), total_bytes=self.recorder.total_bytes()
+        )
+        self.overlay.open_session_picker()
+
+    def open_session(self, session_id: str) -> None:
+        row = self.recorder.row_for(session_id)
+        events = self.recorder.read_session(session_id)
+        if row is None:
+            self.overlay.append_system("That session is no longer on disk.")
+            return
+        store = self.recorder.store_for(session_id)
+        self.overlay.viewer.show_session(
+            row,
+            events,
+            frames_directory=store.frames_directory if store is not None else None,
+        )
+        self.overlay.show_session_viewer()
+
+    def _on_session_changed(self, session_id: str, _title: str) -> None:
+        self.observer.session_id = session_id
+        self.responder.session_id = session_id
+        self.journal_compactor.session_id = session_id
+
+    def _on_session_renamed(self, session_id: str, title: str) -> None:
+        self.recorder.rename_session(session_id, title)
+        if self._viewing(session_id):
+            self.open_session(session_id)
+
+    def _on_session_deleted(self, session_id: str) -> None:
+        viewing = self._viewing(session_id)
+        self.recorder.delete_session(session_id)
+        if viewing:
+            self.overlay.viewer.clear()
+            self.overlay.show_play()
+
+    def _on_thumbnails_deleted(self, session_id: str) -> None:
+        freed = self.recorder.delete_thumbnails(session_id)
+        if self._viewing(session_id):
+            self.open_session(session_id)
+        if freed:
+            from chiron.sessions.render import format_bytes
+
+            self.overlay.append_system(f"Freed {format_bytes(freed)} of thumbnails.")
+
+    def _viewing(self, session_id: str) -> bool:
+        return (
+            self.overlay.current_view == SESSION_VIEW
+            and self.overlay.viewer.session_id == session_id
+        )
+
+    # -------------------------------------------------------------- watching
+
+    @property
+    def watch_requested(self) -> bool:
+        return self._watch_requested
+
+    @property
+    def watching(self) -> bool:
+        """User-requested Watch state, independent of temporary Observer outage."""
+        return self._watch_requested
+
+    @property
+    def capture_active(self) -> bool:
+        return self.capture.is_watching
+
+    def set_watching(self, watching: bool) -> None:
+        if watching == self._watch_requested:
+            return
+        if watching:
+            self.window_tracker.poll()
+            self.ensure_session()
+            self._watch_requested = True
+            self._warned_not_watching = False
+            self._invalidate_frames()
+            self.overlay.set_watching(True, self.settings.hotkeys.toggle_watching)
+            self.recorder.record_watch(True)
+            info = self.window_tracker.current
+            if info is not None:
+                self._record_game(info, changed=False)
+                if not self.settings.game_name.strip():
+                    described = info.describe()
+                    self.observer.detected_game = described
+                    self.responder.detected_game = described
+                    self.journal_service.record(
+                        f"Watching started; the player is in {described}.",
+                        source="system",
+                    )
+            self.overlay.append_system(
+                "● Watch requested. Connecting Chiron-Observer before capture starts."
+            )
+            if self.observer.status == "live":
+                self._activate_capture()
+            else:
+                self.observer.start()
+            return
+
+        # Privacy boundary: stop and invalidate before closing the socket.
+        self._watch_requested = False
+        self.capture.set_watching(False)
+        self._invalidate_frames()
+        self._flush_waiting_immediate()
+        self.overlay.set_watching(False, self.settings.hotkeys.toggle_watching)
+        self.recorder.record_watch(False)
+        self.overlay.append_system(
+            "○ Stopped watching. Chiron-Responder can still answer from the "
+            "existing journal and conversation."
+        )
+        self._schedule(self.observer.stop())
+
+    def toggle_watching(self) -> None:
+        self.set_watching(not self.watch_requested)
+
+    def _activate_capture(self) -> None:
+        if not self.watch_requested or self.observer.status != "live":
+            return
+        self._invalidate_frames()
+        self.capture.set_watching(True)
+        self.overlay.append_system("● Observer connected; capture is active.")
+
+    def _on_observer_status(self, status: str, detail: str) -> None:
+        self.overlay.set_status(status, f"Observer: {detail}" if detail else "Observer")
+        if status == "live" and self.watch_requested:
+            self._activate_capture()
+            return
+        if status != "live":
+            self.capture.set_watching(False)
+            self._invalidate_frames()
+            self._flush_waiting_immediate()
+
+    # ------------------------------------------------------------- questions
+
+    def _on_prompt(self, text: str) -> None:
+        self.overlay.append_user(text)
+        self.ensure_session()
+        self.recorder.record_message("user", text, agent_id="responder")
+        immediate = self.settings.capture.question_frame_policy == "immediate"
+        self._questions.append(_PendingQuestion(text, immediate))
+        if not self.capture_active and not self._warned_not_watching:
+            self._warned_not_watching = True
+            self.overlay.append_system(
+                "Chiron-Observer is unavailable, so this answer uses stale journal "
+                "and conversation context without a current screenshot."
+            )
+        self._resolve_questions()
+
+    def _resolve_questions(self) -> None:
+        if self._waiting_immediate is not None:
+            return
+        while self._questions:
+            question = self._questions.popleft()
+            if question.immediate and self.capture_active:
+                self._question_token += 1
+                token = self._question_token
+                self._waiting_immediate = (token, question)
+                if self.capture.request_immediate(token):
+                    return
+                self._waiting_immediate = None
+            frame = self._latest_frame if self.capture_active else None
+            self._submit_question(question, frame)
+
+    def _submit_question(self, question: _PendingQuestion, frame: Frame | None) -> None:
+        if frame is not None:
+            self.recorder.record_frame(
+                frame,
+                "immediate" if question.immediate else "question",
+                agent_id="responder",
+            )
+        self.responder.ask(question.text, frame, self._observer_snapshot())
+
+    def _on_immediate_frame(self, frame: Frame, token: object) -> None:
+        waiting = self._waiting_immediate
+        if waiting is None or token != waiting[0]:
+            return
+        self._waiting_immediate = None
+        question = waiting[1]
+        if self.capture_active and self.observer.status == "live":
+            self.observer.observe(frame, "immediate")
+            self._submit_question(question, frame)
+        else:
+            self._submit_question(question, None)
+        self._resolve_questions()
+
+    def _flush_waiting_immediate(self) -> None:
+        waiting, self._waiting_immediate = self._waiting_immediate, None
+        self.capture.clear_pending()
+        if waiting is not None:
+            self._submit_question(waiting[1], None)
+        self._resolve_questions()
+
+    def _observer_snapshot(self) -> ObserverStatus:
+        state = self.observer.status
+        if not self.watch_requested:
+            state = "watch_off"
+        return ObserverStatus(
+            state=state,
+            watch_requested=self.watch_requested,
+            last_observed_at=self.observer.last_observed_at,
+            detail=self.observer.status_detail,
+        )
+
+    # --------------------------------------------------------------- frames
+
+    def _on_scheduled_frame(self, frame: Frame) -> None:
+        if not self.capture_active or self.observer.status != "live":
+            return
+        self._latest_frame = frame
+        self.observer.observe(frame, "scheduled")
+
+    def _invalidate_frames(self) -> None:
+        self._latest_frame = None
+        self.capture.clear_pending()
+
+    # -------------------------------------------------------------- handlers
+
+    def _on_capture_error(self, message: str) -> None:
+        self.capture.set_watching(False)
+        self._invalidate_frames()
+        self._flush_waiting_immediate()
+        self.overlay.append_system(f"⚠ {message}")
+
+    def _on_observer_error(self, message: str) -> None:
+        self.overlay.append_system(f"⚠ Observer: {message}")
+
+    def _on_responder_error(self, message: str) -> None:
+        self.overlay.append_system(f"⚠ Responder: {message}")
+
+    def _on_answer(self, text: str) -> None:
+        self.recorder.record_message("assistant", text, agent_id="responder")
+
+    def _on_compacted(self, payload: dict) -> None:
+        self.recorder.record_compaction(payload)
+        if payload.get("agent_id") == "observer":
+            self.overlay.append_system(
+                "✂ Observer rotated its Live context and will reseed from journal "
+                "memory."
+            )
+        elif payload.get("agent_id") == "journal":
+            before = int(payload.get("tokens_before") or 0)
+            after = int(payload.get("tokens_after") or 0)
+            self.overlay.append_system(
+                "✂ Journal compacted older entries into durable model memory "
+                f"({before:,} → {after:,} tokens)."
+            )
+        else:
+            before = int(payload.get("tokens_before") or 0)
+            after = int(payload.get("tokens_after") or 0)
+            detail = f" ({before:,} → {after:,} tokens)" if before else ""
+            self.overlay.append_system(
+                f"✂ Responder summarised earlier conversation{detail}."
+            )
+
+    def _on_journal_entry(self, entry: JournalEntry) -> None:
+        self.overlay.append_journal(entry)
+        self.recorder.record_journal_entry(entry)
+
+    # ---------------------------------------------------------- active window
+
+    def _detected_game_label(self) -> str:
+        current = self.window_tracker.current
+        return current.label if current is not None else ""
+
+    def _chiron_window_ids(self) -> set[int]:
+        ids = {int(self.overlay.winId())}
+        if self.settings_window is not None:
+            ids.add(int(self.settings_window.winId()))
+        return ids
+
+    def _on_active_window(self, info: WindowInfo) -> None:
+        if not self.settings.game_name.strip():
+            described = info.describe()
+            self.observer.detected_game = described
+            self.responder.detected_game = described
+        if self.watch_requested:
+            self.journal_service.record(
+                f"The player switched to {info.describe()}.", source="system"
+            )
+            self._record_game(info, changed=True)
+
+    def _record_game(self, info: WindowInfo, *, changed: bool) -> None:
+        self.recorder.record_game(
+            label=info.label,
+            identity=":".join(str(part) for part in info.identity),
+            described=info.describe(),
+            changed=changed,
+        )
+
+    # --------------------------------------------------------------- hotkeys
+
     def _hotkey_bindings(self) -> dict[str, str]:
-        """The name → combination map handed to the hotkey manager."""
         hotkeys = self.settings.hotkeys
         return {
             "toggle_overlay": hotkeys.toggle_overlay,
@@ -185,159 +556,18 @@ class ChironApp(QObject):
             "toggle_watching": hotkeys.toggle_watching,
             "start_watching": hotkeys.start_watching,
             "stop_watching": hotkeys.stop_watching,
+            "toggle_journal": hotkeys.toggle_journal,
         }
 
     def _watch_hotkey_hint(self) -> str:
-        """However the player has chosen to start watching, in words."""
         hotkeys = self.settings.hotkeys
-        if hotkeys.toggle_watching.strip():
-            return hotkeys.toggle_watching
-        if hotkeys.start_watching.strip():
-            return hotkeys.start_watching
-        return "the eye button above"
-
-    async def shutdown(self) -> None:
-        """Stop everything and persist the overlay's placement."""
-        logger.info("Shutting down")
-        self.fold_timer.stop()
-        self.footer_timer.stop()
-        self.hotkeys.stop()
-        self.window_tracker.stop()
-        self.capture.stop()
-        self._remember_geometry()
-        try:
-            save_settings(self.settings, self.settings_path)
-        except OSError as error:
-            logger.warning("Could not save settings on exit: %s", error)
-        await self.session.stop()
-
-    def request_quit(self) -> None:
-        """Ask the main loop to shut the application down."""
-        self.quit_requested.set()
-
-    # -------------------------------------------------------------- watching
-
-    @property
-    def watching(self) -> bool:
-        """Whether Chiron is currently reading the screen."""
-        return self.capture.is_watching
-
-    def set_watching(self, watching: bool) -> None:
-        """Start or stop watching the screen.
-
-        Starting also opens the live session, since frames with nowhere to go are
-        pure cost. Stopping closes it: "stop watching" should leave nothing
-        running that could still see anything, and the journal means the next
-        session picks up knowing what happened rather than starting blank.
-
-        Args:
-            watching (bool): The state to move to. Repeating the current state
-                does nothing.
-        """
-        if watching == self.watching:
-            return
-
-        if watching:
-            # A fresh look before anything else: while `self.watching` is still
-            # False this cannot double-journal through _on_active_window.
-            self.window_tracker.poll()
-
-        self.capture.set_watching(watching)
-        self.overlay.set_watching(watching, self.settings.hotkeys.toggle_watching)
-
-        if watching:
-            info = self.window_tracker.current
-            if info is not None and not self.settings.game_name.strip():
-                self.session.detected_game = info.describe()
-                self.journal.append(
-                    f"Watching started; the player is in {info.describe()}.",
-                    source="system",
-                )
-                self.overlay.append_system(
-                    f"● Watching your screen — looks like {info.label}."
-                )
-            else:
-                self.overlay.append_system("● Watching your screen.")
-            if self.session.status in ("idle", "stopped", "error"):
-                self.session.start()
-        else:
-            self.overlay.append_system(
-                "○ Stopped watching. Chiron can still answer from what it "
-                "already noted."
-            )
-            asyncio.ensure_future(self.session.stop())
-
-    def toggle_watching(self) -> None:
-        """Flip the watching state."""
-        self.set_watching(not self.watching)
-
-    # -------------------------------------------------------------- handlers
-
-    def _on_prompt(self, text: str) -> None:
-        """Send a question, bursting the shutter so the answer is about *now*.
-
-        A question asked while not watching is still sent — the model can answer
-        from the journal and the conversation — but the player is told once that
-        nothing on screen is being seen, because "I can't see your screen" from a
-        screen-watching assistant is otherwise baffling.
-        """
-        self.overlay.append_user(text)
-        if self.watching:
-            self.capture.request_burst("question")
-        elif not self._warned_not_watching:
-            self._warned_not_watching = True
-            self.overlay.append_system(
-                f"Chiron is not watching, so it cannot see your screen right now "
-                f"— press {self._watch_hotkey_hint()} to let it look."
-            )
-        if self.session.status in ("idle", "stopped"):
-            self.session.start()
-        self.session.send_text(text)
-
-    def _on_frame(self, frame: Frame) -> None:
-        """Forward a captured frame to the session."""
-        self.session.send_frame(frame)
-
-    def _on_scene_change(self, distance: float) -> None:
-        """Log a hard scene change; the capture service has already burst."""
-        logger.debug("Scene change detected (distance %.3f)", distance)
-
-    def _on_capture_error(self, message: str) -> None:
-        """Report a capture failure in the overlay."""
-        self.overlay.append_system(f"⚠ {message}")
-
-    def _on_session_error(self, message: str) -> None:
-        """Report a session failure in the overlay."""
-        self.overlay.append_system(f"⚠ {message}")
-
-    def _on_journal_entry(self, entry: JournalEntry) -> None:
-        """Show a new journal entry inline in the transcript."""
-        self.overlay.append_journal(entry)
-
-    def _chiron_window_ids(self) -> set[int]:
-        """Chiron's own window ids, which can never be "the player's window"."""
-        ids = {int(self.overlay.winId())}
-        if self.settings_window is not None:
-            ids.add(int(self.settings_window.winId()))
-        return ids
-
-    def _on_active_window(self, info: WindowInfo) -> None:
-        """Note that the player moved to a different application.
-
-        The session's ``detected_game`` is kept current so the next connection's
-        instruction names the right game, and while watching, the switch is
-        journaled — the running session's instruction is fixed, so the fold is
-        how it learns mid-session.
-        """
-        if not self.settings.game_name.strip():
-            self.session.detected_game = info.describe()
-        if self.watching:
-            self.journal.append(
-                f"The player switched to {info.describe()}.", source="system"
-            )
+        return (
+            hotkeys.toggle_watching.strip()
+            or hotkeys.start_watching.strip()
+            or ("the eye button above")
+        )
 
     def _on_hotkey(self, name: str) -> None:
-        """Act on a global hotkey."""
         if name == "toggle_overlay":
             self.overlay.toggle()
         elif name == "open_settings":
@@ -348,24 +578,30 @@ class ChironApp(QObject):
             self.set_watching(True)
         elif name == "stop_watching":
             self.set_watching(False)
+        elif name == "toggle_journal":
+            if self.overlay.isVisible():
+                self.overlay.toggle_journal()
+            else:
+                self.overlay.show_and_focus()
+                self.overlay.set_journal_open(True)
+
+    # --------------------------------------------------------------- footer
 
     def _refresh_footer(self) -> None:
-        """Update the overlay's small status line."""
-        if not self.watching:
+        if not self.watch_requested:
             shutter = "not watching"
+        elif not self.capture_active:
+            shutter = f"paused ({self.observer.status})"
         else:
-            mode = self.capture.scheduler.mode(time.time())
-            reason = self.capture.scheduler.burst_reason
-            shutter = f"{mode} ({reason})" if reason else mode
+            shutter = f"fixed {self.settings.capture.interval_seconds:g}s"
         self.overlay.set_footer(
-            f"shutter: {shutter}  ·  frames sent: {self.session.frames_sent}"
+            f"capture: {shutter}  ·  Observer frames: {self.observer.frames_sent}"
             f"  ·  journal: {len(self.journal)}"
         )
 
     # -------------------------------------------------------------- settings
 
     def show_settings(self) -> None:
-        """Open (or raise) the settings window."""
         if self.settings_window is None:
             self.settings_window = SettingsWindow(self.settings)
             self.settings_window.settingsSaved.connect(self.apply_settings)
@@ -375,79 +611,128 @@ class ChironApp(QObject):
         current = self.window_tracker.current
         self.settings_window.set_detected_game(current.label if current else "")
         self.settings_window.load(self.settings)
+        self.settings_window.refresh_catalogue()
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
 
     def apply_settings(self, new_settings: Settings) -> None:
-        """Persist and apply edited settings, restarting the session if needed.
-
-        Args:
-            new_settings (Settings): The configuration to adopt.
-        """
+        try:
+            new_settings = Settings.model_validate(new_settings.model_dump())
+        except ValueError as error:
+            self.overlay.append_system(f"⚠ Settings were not applied: {error}")
+            return
         previous = self.settings
-        # Placement is owned by the overlay, not the settings form.
         self._remember_geometry()
         new_settings.overlay.position_x = previous.overlay.position_x
         new_settings.overlay.position_y = previous.overlay.position_y
+        new_settings.overlay.journal_open = previous.overlay.journal_open
+        new_settings.overlay.journal_width = previous.overlay.journal_width
         self.settings = new_settings
-
         try:
             save_settings(new_settings, self.settings_path)
         except OSError as error:
             self.overlay.append_system(f"⚠ Could not save settings: {error}")
 
-        self.capture.apply_settings(new_settings.capture)
+        width_changed = previous.capture.frame_width != new_settings.capture.frame_width
+        self.capture.apply_settings(new_settings.effective_capture())
+        if width_changed:
+            self._invalidate_frames()
         self.overlay.apply_settings(new_settings.overlay)
-        self.journal.max_entries = new_settings.journal.max_entries
-        self.fold_timer.setInterval(
-            int(new_settings.journal.fold_interval_seconds * 1000)
-        )
         self.hotkeys.set_bindings(self._hotkey_bindings())
-        self.overlay.set_watching(self.watching, new_settings.hotkeys.toggle_watching)
+        self.overlay.set_watching(
+            self.watch_requested, new_settings.hotkeys.toggle_watching
+        )
         self.overlay.set_hide_hint(new_settings.hotkeys.toggle_overlay)
-        self.session.apply_settings(new_settings)
+        self.observer.apply_settings(new_settings)
+        self.responder.apply_settings(new_settings)
+        self.journal_compactor.apply_settings(new_settings)
+        self.recorder.record_settings_changed(
+            _changed_fields(previous, new_settings), "dual_agent"
+        )
 
-        strategy_changed = previous.journal.strategy != new_settings.journal.strategy
-        if previous.requires_session_restart(new_settings) or strategy_changed:
-            asyncio.ensure_future(self._restart_session(strategy_changed))
+        if previous.requires_observer_reconnect(new_settings):
+            self._schedule(self._reconnect_observer())
+        if previous.requires_responder_rebuild(new_settings):
+            self._schedule(self._rebuild_responder())
         self.overlay.append_system("Settings saved.")
 
-    async def _restart_session(self, rebuild_writer: bool) -> None:
-        """Reconnect with the new configuration, keeping the journal.
+    async def _reconnect_observer(self) -> None:
+        self.capture.set_watching(False)
+        self._invalidate_frames()
+        self._flush_waiting_immediate()
+        await self.observer.stop()
+        if self.watch_requested:
+            self.observer.start()
 
-        Args:
-            rebuild_writer (bool): True when the journal strategy changed, which
-                means the old writer has to be stopped and replaced.
-        """
-        await self.session.stop()
-        if rebuild_writer:
-            await self.writer.stop()
-            self.writer = self._build_writer()
-            self.session.writer = self.writer
-        # Reconnect only if the screen is still being watched. Editing settings
-        # must never be a back door into watching.
-        if self.watching:
-            self.session.start()
+    async def _rebuild_responder(self) -> None:
+        old = self.responder
+        await old.stop()
+        detected, session_id = old.detected_game, old.session_id
+        self.responder = ResponderSessionManager(
+            self.settings,
+            self.journal_service.reader(),
+            self.conversation,
+            parent=self,
+        )
+        self.responder.detected_game = detected
+        self.responder.session_id = session_id
+        self._connect_responder()
 
     def _remember_geometry(self) -> None:
-        """Record the overlay's position and size into settings."""
         x, y, width, height = self.overlay.current_geometry()
         self.settings.overlay.position_x = x
         self.settings.overlay.position_y = y
         self.settings.overlay.width = width
         self.settings.overlay.height = height
+        self.settings.overlay.journal_open = self.overlay.journal_open
+
+    @staticmethod
+    def _schedule(coroutine) -> asyncio.Task | None:
+        """Schedule app work only when qasync is actually running."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            coroutine.close()
+            return None
+        return loop.create_task(coroutine)
+
+
+def describe_untouched_sessions(root: Path | None = None) -> list[str]:
+    """Lines for the ``--fresh-install`` plan saying play history is safe."""
+    from chiron.sessions.render import format_bytes
+    from chiron.sessions.store import SessionIndex, sessions_root
+
+    directory = root if root is not None else sessions_root()
+    if not directory.is_dir():
+        return []
+    index = SessionIndex(directory)
+    rows = index.rows()
+    if not rows:
+        return []
+    noun = "session" if len(rows) == 1 else "sessions"
+    return [
+        f"keep    {directory}{os.sep} "
+        f"({len(rows)} recorded {noun}, {format_bytes(index.total_bytes())}; "
+        "not Chiron's configuration)"
+    ]
+
+
+def _changed_fields(previous: Settings, current: Settings) -> list[str]:
+    changed: list[str] = []
+    before, after = previous.model_dump(), current.model_dump()
+    for name, old in before.items():
+        new = after.get(name)
+        if isinstance(old, dict) and isinstance(new, dict):
+            changed.extend(
+                f"{name}.{key}" for key, value in old.items() if new.get(key) != value
+            )
+        elif old != new:
+            changed.append(name)
+    return changed
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse command-line arguments.
-
-    Args:
-        argv (list[str] | None): Arguments to parse; defaults to ``sys.argv``.
-
-    Returns:
-        argparse.Namespace: Parsed options.
-    """
     parser = argparse.ArgumentParser(
         prog="chiron", description="An AI gaming assistant that watches your screen."
     )
@@ -467,15 +752,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fresh-install",
         action="store_true",
         help=(
-            "Delete Chiron's saved configuration — including any saved API key — "
+            "Delete Chiron's saved configuration, including any saved API key, "
             "and exit, so the next run starts as if newly installed. Asks first."
         ),
     )
     parser.add_argument(
-        "--yes",
-        "-y",
-        action="store_true",
-        help="Answer yes to the --fresh-install confirmation (for scripts).",
+        "--yes", "-y", action="store_true", help="Confirm --fresh-install."
     )
     return parser.parse_args(argv)
 
@@ -487,58 +769,34 @@ def fresh_install(
     stream: TextIO | None = None,
     confirm: Callable[[str], str] | None = None,
 ) -> int:
-    """Delete the saved configuration after showing exactly what goes.
-
-    Deletion is irreversible and takes the API key with it, so the plan is
-    printed first and confirmation is required. When the answer cannot be asked
-    for — a pipe, a cron job, no terminal — nothing is deleted and the caller is
-    told to pass ``--yes``. Silence is not consent.
-
-    Args:
-        settings_path (Path): The settings file to remove.
-        assume_yes (bool): Skip the prompt.
-        stream (TextIO | None): Where to write. Defaults to stdout.
-        confirm (Callable[[str], str] | None): Prompt function. Defaults to
-            :func:`input`, and is only called on an interactive terminal.
-
-    Returns:
-        int: Process exit code — 0 for done or nothing to do, 1 for cancelled or
-            unable to ask.
-    """
     out = stream or sys.stdout
     plan = plan_removal(settings_path)
-
     if plan.is_empty:
-        print(f"Nothing to remove — no configuration at {settings_path}.", file=out)
+        print(f"Nothing to remove: no configuration at {settings_path}.", file=out)
         return 0
-
     print("This will:", file=out)
     for line in plan.describe():
         print(f"  {line}", file=out)
+    for line in describe_untouched_sessions():
+        print(f"  {line}", file=out)
     if plan.holds_api_key:
         print(
-            "\nYour saved Gemini API key is in that file and will be gone. "
-            "No backup is kept.",
+            "\nYour saved API key is in that file and will be gone. No backup is kept.",
             file=out,
         )
-
     if not assume_yes:
         ask = confirm
         if ask is None:
-            # Only the real prompt needs a terminal to read from.
             if not sys.stdin.isatty():
                 print(
-                    "\nNot a terminal, so nothing was removed. "
-                    "Re-run with --yes if you meant it.",
+                    "\nNot a terminal, so nothing was removed. Re-run with --yes.",
                     file=out,
                 )
                 return 1
             ask = input
-        answer = ask("\nRemove it? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
+        if ask("\nRemove it? [y/N] ").strip().lower() not in ("y", "yes"):
             print("Cancelled; nothing was removed.", file=out)
             return 1
-
     removed = remove_configuration(settings_path)
     for line in removed.describe():
         if line.startswith("delete"):
@@ -548,46 +806,27 @@ def fresh_install(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run Chiron.
-
-    Args:
-        argv (list[str] | None): Command-line arguments.
-
-    Returns:
-        int: Process exit code.
-    """
     args = parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
-
     settings_path = Path(args.settings or default_settings_path())
     if args.fresh_install:
-        # Handled before any Qt object exists: this command never wants a window,
-        # and a GUI that fails to start must not stop someone wiping their config.
         return fresh_install(settings_path, assume_yes=args.yes)
-
     app = QApplication(sys.argv)
     app.setApplicationName("Chiron")
     app.setApplicationDisplayName("Chiron")
-    # Hiding the overlay must not end the process — the hotkey has to be able to
-    # bring it back.
     app.setQuitOnLastWindowClosed(False)
-
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
-
     chiron = ChironApp(load_settings(settings_path), settings_path)
-
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, chiron.request_quit)
-        except (NotImplementedError, RuntimeError):  # pragma: no cover - platform
+        except (NotImplementedError, RuntimeError):  # pragma: no cover
             signal.signal(sig, lambda *_: chiron.request_quit())
-
     app.aboutToQuit.connect(chiron.request_quit)
-
     with loop:
         chiron.start()
         loop.run_until_complete(chiron.quit_requested.wait())
@@ -595,5 +834,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - manual entry point
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

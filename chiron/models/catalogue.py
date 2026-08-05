@@ -17,8 +17,15 @@ model family, and a Gemini model's price comes from chiron's own table or is mar
 unknown. :class:`ModelInfo` therefore carries ``pricing_known``: a picker that prints
 "Free" for a model it simply has no rate for is worse than one that prints nothing.
 
+**One Google fetch populates two agent catalogues.** ``supportedGenerationMethods``
+separates a Live API model (``bidiGenerateContent``) from an ordinary one
+(``generateContent``). A model may support both, so :func:`list_google_models` can
+emit a ``live/…`` Observer entry and a ``gemini/…`` Responder entry for the same
+provider model.
+
 Everything here is best-effort: a failed fetch returns a stale cache if one exists
-and an empty list otherwise, and the settings UI falls back to free-text entry.
+and a small static list otherwise, so the picker is never empty and the settings UI
+still accepts a typed id for anything a catalogue has not caught up with.
 """
 
 from __future__ import annotations
@@ -26,12 +33,12 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from chiron.models.google_pricing import get_pricing as google_pricing
 from chiron.models.pricing import litellm_pricing
-from chiron.models.providers import GOOGLE, OPENROUTER, to_litellm_id
+from chiron.models.providers import GOOGLE, LIVE, OPENROUTER, to_litellm_id
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,10 @@ _GOOGLE_MAX_PAGES = 5
 #: the inference is a denylist. Wrong in the safe direction: a mislabelled model still
 #: appears in the picker, just with a "no tools" caveat the user can override.
 _NO_TOOL_MARKERS = ("gemma", "embedding", "aqa", "imagen", "veo", "tts", "image")
+
+#: Google's generation methods, by the mode each implies.
+_LIVE_METHOD = "bidiGenerateContent"
+_CHAT_METHOD = "generateContent"
 
 
 @dataclass(frozen=True)
@@ -85,6 +96,10 @@ class ModelInfo:
             same reason: this flag is only ever used to *warn* (the literary research
             agent looks at illustrations), and warning on an absence of evidence would
             cry wolf on every model a catalogue happens not to describe.
+        is_live (bool): Whether this entry runs over the Live API — a persistent
+            websocket — rather than a request/response endpoint. Carried
+            explicitly rather than derived from the prefix because it is the one
+            fact the rest of the app branches on.
     """
 
     id: str
@@ -98,6 +113,34 @@ class ModelInfo:
     pricing_known: bool
     supports_tools: bool
     supports_vision: bool = True
+    is_live: bool = False
+
+    def label(self) -> str:
+        """The picker's one-line description of this model.
+
+        ``provider · id · live/non-live · $in/$out per M tokens``, with the price
+        omitted rather than guessed when nothing knows the rate: a picker that
+        prints "$0.00" for a model it simply has no rate for is worse than one
+        that says nothing.
+        """
+        mode = "live" if self.is_live else "non-live"
+        parts = [_PROVIDER_LABELS.get(self.provider, self.provider), self.id, mode]
+        if self.pricing_known:
+            parts.append(
+                f"${self.prompt_price * 1_000_000:.2f}/"
+                f"${self.completion_price * 1_000_000:.2f} per M"
+            )
+        else:
+            parts.append("pricing unavailable")
+        return "  ·  ".join(parts)
+
+
+#: Short provider names for :meth:`ModelInfo.label`.
+_PROVIDER_LABELS = {
+    LIVE: "Live API",
+    GOOGLE: "AI Studio",
+    OPENROUTER: "OpenRouter",
+}
 
 
 def _f(value: object) -> float:
@@ -225,20 +268,24 @@ def list_models(
 # --------------------------------------------------------------------------- #
 # Google AI Studio
 # --------------------------------------------------------------------------- #
-def _parse_google(entry: dict) -> ModelInfo | None:
-    """Build a :class:`ModelInfo` from one raw ``v1beta/models`` entry, or None.
+def _parse_google(entry: dict) -> list[ModelInfo]:
+    """Build the :class:`ModelInfo` entries one raw ``v1beta/models`` entry implies.
 
-    Returns None for anything that can't hold a conversation — embedding models,
-    answer-attribution models and the like — since a picker choosing the agent's
-    brain should not offer them.
+    Usually one, occasionally two: a model that serves both ``generateContent``
+    and ``bidiGenerateContent`` is eligible for two different agent roles, with
+    different transports and costs.
+
+    Returns an empty list for anything that can't hold a conversation at all —
+    embedding models, answer-attribution models and the like — since a picker
+    choosing what Chiron thinks with should not offer them.
     """
     name = entry.get("name")
     if not isinstance(name, str) or not name:
-        return None
+        return []
     model_ref = name.removeprefix("models/")
     methods = entry.get("supportedGenerationMethods")
-    if not isinstance(methods, list) or "generateContent" not in methods:
-        return None
+    if not isinstance(methods, list):
+        return []
 
     litellm_id = to_litellm_id(model_ref, GOOGLE)
     # Same cascade the ledger prices a call with (see LiteLLMModel._price_call), so the
@@ -246,18 +293,30 @@ def _parse_google(entry: dict) -> ModelInfo | None:
     pricing = google_pricing(litellm_id) or litellm_pricing(litellm_id)
     context = entry.get("inputTokenLimit")
     lowered = model_ref.lower()
-    return ModelInfo(
-        id=litellm_id,
-        provider=GOOGLE,
-        provider_model_id=model_ref,
-        name=entry.get("displayName") or model_ref,
-        vendor="google",
-        context_length=int(context) if isinstance(context, (int, float)) else None,
-        prompt_price=pricing.prompt if pricing else 0.0,
-        completion_price=pricing.completion if pricing else 0.0,
-        pricing_known=pricing is not None,
-        supports_tools=not any(marker in lowered for marker in _NO_TOOL_MARKERS),
-    )
+    common = {
+        "provider_model_id": model_ref,
+        "name": entry.get("displayName") or model_ref,
+        "vendor": "google",
+        "context_length": int(context) if isinstance(context, (int, float)) else None,
+        "prompt_price": pricing.prompt if pricing else 0.0,
+        "completion_price": pricing.completion if pricing else 0.0,
+        "pricing_known": pricing is not None,
+        "supports_tools": not any(marker in lowered for marker in _NO_TOOL_MARKERS),
+    }
+
+    models: list[ModelInfo] = []
+    if _CHAT_METHOD in methods:
+        models.append(ModelInfo(id=litellm_id, provider=GOOGLE, **common))
+    if _LIVE_METHOD in methods:
+        models.append(
+            ModelInfo(
+                id=to_litellm_id(model_ref, LIVE),
+                provider=LIVE,
+                is_live=True,
+                **common,
+            )
+        )
+    return models
 
 
 def list_google_models(
@@ -283,8 +342,9 @@ def list_google_models(
         ttl_seconds (int): Seconds before the cache is considered stale.
 
     Returns:
-        list[ModelInfo]: Text-generation models sorted newest-looking first; empty
-            when there is no key, or the fetch failed with no usable cache.
+        list[ModelInfo]: Conversational models sorted newest-looking first, with
+            live and non-live entries interleaved; empty when there is no key, or
+            the fetch failed with no usable cache.
     """
     if not api_key:
         return []
@@ -318,15 +378,224 @@ def list_google_models(
         logger.warning("Could not fetch the Google model catalogue", exc_info=True)
         return _read_cache(cache_path, ttl=2**31) or []
 
-    models = [m for m in (_parse_google(e) for e in raw) if m]
+    models = [m for entry in raw for m in _parse_google(entry)]
     if not models:
         return _read_cache(cache_path, ttl=2**31) or []
 
     # Google returns models in no useful order and its ids sort newest-last
     # ("1.5" before "2.5"), so reverse the natural sort to surface current families.
-    models.sort(key=lambda m: m.provider_model_id.lower(), reverse=True)
+    models.sort(key=lambda m: (m.provider_model_id.lower(), m.provider), reverse=True)
     _write_cache(cache_path, models)
     return models
 
 
-__all__ = ["ModelInfo", "list_google_models", "list_models", "to_litellm_id"]
+# --------------------------------------------------------------------------- #
+# The picker's combined view
+# --------------------------------------------------------------------------- #
+#: Enough of a catalogue to choose from with no network and no cache. Deliberately
+#: tiny — it exists so a first run offline still offers something sane, not so it
+#: can stand in for the real lists.
+STATIC_MODELS: list[ModelInfo] = [
+    ModelInfo(
+        id="live/gemini-3.1-flash-live-preview",
+        provider=LIVE,
+        provider_model_id="gemini-3.1-flash-live-preview",
+        name="Gemini 3.1 Flash (Live)",
+        vendor="google",
+        context_length=128_000,
+        prompt_price=0.0,
+        completion_price=0.0,
+        pricing_known=False,
+        supports_tools=True,
+        is_live=True,
+    ),
+    ModelInfo(
+        id="gemini/gemini-3.6-flash",
+        provider=GOOGLE,
+        provider_model_id="gemini-3.6-flash",
+        name="Gemini 3.6 Flash",
+        vendor="google",
+        context_length=1_048_576,
+        prompt_price=1.50 / 1_000_000,
+        completion_price=7.50 / 1_000_000,
+        pricing_known=True,
+        supports_tools=True,
+    ),
+    ModelInfo(
+        id="gemini/gemini-2.5-flash",
+        provider=GOOGLE,
+        provider_model_id="gemini-2.5-flash",
+        name="Gemini 2.5 Flash",
+        vendor="google",
+        context_length=1_000_000,
+        prompt_price=0.30 / 1_000_000,
+        completion_price=2.50 / 1_000_000,
+        pricing_known=True,
+        supports_tools=True,
+    ),
+    ModelInfo(
+        id="openrouter/google/gemini-2.5-flash",
+        provider=OPENROUTER,
+        provider_model_id="google/gemini-2.5-flash",
+        name="Google: Gemini 2.5 Flash",
+        vendor="google",
+        context_length=1_000_000,
+        prompt_price=0.30 / 1_000_000,
+        completion_price=2.50 / 1_000_000,
+        pricing_known=True,
+        supports_tools=True,
+    ),
+]
+
+
+def available_models(
+    *,
+    google_key: str = "",
+    openrouter_key: str = "",
+    force: bool = False,
+) -> list[ModelInfo]:
+    """Every model the configured keys can actually reach, for the picker.
+
+    **A provider is activated by supplying its key.** No key, no entries — which
+    is the honest answer, since without one nothing from that provider is
+    callable. Google's key covers both the Live API and AI Studio, so one fetch
+    populates both.
+
+    Non-live entries are filtered to image-capable models: a Chiron that cannot
+    see the screen is not a Chiron.
+
+    Blocking HTTP on a cache miss; call it from a thread.
+
+    Args:
+        google_key (str): Gemini key, for the Live API and AI Studio entries.
+        openrouter_key (str): OpenRouter key.
+        force (bool): Skip the disk caches and re-fetch.
+
+    Returns:
+        list[ModelInfo]: Live Observer entries followed by non-live Responder
+            entries. Falls back to applicable static entries when catalogue
+            fetches yield nothing.
+    """
+    models: list[ModelInfo] = list(
+        list_google_models(google_key, force=force) if google_key else []
+    )
+    if openrouter_key:
+        models.extend(
+            m for m in list_models(force=force) if m.supports_vision and not m.is_live
+        )
+    if not models:
+        return [
+            model
+            for model in STATIC_MODELS
+            if model.provider != OPENROUTER or bool(openrouter_key)
+        ]
+    models.sort(key=lambda m: (not m.is_live, m.provider, m.vendor.lower(), m.id))
+    return models
+
+
+def cached_context_length_info(model_id: str) -> tuple[int, str] | None:
+    """The model's context window and provenance without touching the network.
+
+    Compaction asks this before every question, so it must be cheap and offline:
+    a blocking HTTP request on the path between a player pressing Enter and an
+    answer starting is not a trade any context accounting is worth. A cold cache
+    simply answers None and the caller falls back to litellm's bundled map.
+
+    Args:
+        model_id (str): The litellm id to look up.
+
+    Returns:
+        tuple[int, str] | None: Tokens plus a human-readable source, or None.
+    """
+    target = (model_id or "").strip()
+    if not target:
+        return None
+    forever = 2**31
+    for cache_path, source in (
+        (_GOOGLE_CACHE, "Google catalogue"),
+        (_OPENROUTER_CACHE, "OpenRouter catalogue"),
+    ):
+        for model in _read_cache(cache_path, ttl=forever) or []:
+            if model.id == target and model.context_length:
+                return int(model.context_length), source
+    for model in STATIC_MODELS:
+        if model.id == target and model.context_length:
+            return int(model.context_length), "bundled metadata"
+    return None
+
+
+def cached_context_length(model_id: str) -> int | None:
+    """The cached context length alone, retained for simple callers."""
+    resolved = cached_context_length_info(model_id)
+    return resolved[0] if resolved is not None else None
+
+
+def find_model(models: list[ModelInfo], model_id: str) -> ModelInfo | None:
+    """The entry for `model_id`, or None when the catalogue has never heard of it."""
+    target = (model_id or "").strip()
+    return next((m for m in models if m.id == target), None)
+
+
+def observer_models(models: list[ModelInfo]) -> list[ModelInfo]:
+    """Gemini Live entries that can be selected for Chiron-Observer."""
+    return [model for model in models if model.is_live and model.provider == LIVE]
+
+
+def responder_models(
+    models: list[ModelInfo], *, mode: str = "fixed_horizon"
+) -> list[ModelInfo]:
+    """Non-live multimodal entries suitable for Chiron-Responder.
+
+    Known tool-incompatible models are excluded in ReAct mode. Unknown custom
+    ids are handled by :func:`describe_unknown` in the picker and remain
+    selectable with a warning.
+    """
+    candidates = [
+        model
+        for model in models
+        if not model.is_live
+        and model.supports_vision
+        and model.provider in {GOOGLE, OPENROUTER}
+    ]
+    if mode == "react":
+        candidates = [model for model in candidates if model.supports_tools]
+    return candidates
+
+
+def describe_unknown(model_id: str) -> ModelInfo:
+    """A placeholder entry for an id typed in by hand.
+
+    The picker has to be able to show a selection it did not supply — an id from
+    an older settings file, or a model released this morning — without pretending
+    to know anything about it.
+    """
+    from chiron.models.providers import provider_for_model
+
+    provider = provider_for_model(model_id)
+    return replace(
+        STATIC_MODELS[0],
+        id=model_id,
+        provider=provider.id if provider else "custom",
+        provider_model_id=model_id,
+        name=model_id,
+        vendor="custom",
+        context_length=None,
+        pricing_known=False,
+        is_live=bool(provider and provider.is_live),
+    )
+
+
+__all__ = [
+    "STATIC_MODELS",
+    "ModelInfo",
+    "available_models",
+    "cached_context_length",
+    "cached_context_length_info",
+    "describe_unknown",
+    "find_model",
+    "list_google_models",
+    "list_models",
+    "observer_models",
+    "responder_models",
+    "to_litellm_id",
+]
