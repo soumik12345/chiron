@@ -159,12 +159,12 @@ def test_settings_window_round_trips_defaults(settings_window):
 
 def test_editing_a_field_shows_up_in_collect(settings_window):
     settings_window.game_name_edit.setText("Elden Ring")
-    settings_window.baseline_spin.setValue(8.0)
+    settings_window.interval_spin.setValue(8.0)
     settings_window.opacity_slider.setValue(60)
 
     collected = settings_window.collect()
     assert collected.game_name == "Elden Ring"
-    assert collected.capture.baseline_interval_seconds == 8.0
+    assert collected.capture.interval_seconds == 8.0
     assert collected.overlay.opacity == pytest.approx(0.6)
 
 
@@ -176,18 +176,26 @@ def test_saving_emits_the_new_settings(settings_window):
     assert received[0].game_name == "Hades"
 
 
+def test_a_live_responder_id_is_rejected_on_save(settings_window):
+    received = []
+    settings_window.settingsSaved.connect(received.append)
+    settings_window.responder_model_picker.choose("live/gemini-3.1-flash-live-preview")
+    settings_window._save()
+    assert received == []
+    assert "Cannot save" in settings_window.restart_badge.text()
+
+
 def test_load_repopulates_the_form(settings_window):
     settings = Settings()
-    settings.journal.strategy = "sidecar"
     settings.capture.frame_width = 1024
+    settings.capture.question_frame_policy = "immediate"
     settings.hotkeys.toggle_overlay = "ctrl+shift+g"
 
     settings_window.load(settings)
 
-    assert settings_window.sidecar_radio.isChecked()
     assert settings_window.frame_width_spin.value() == 1024
+    assert settings_window.question_policy_combo.currentData() == "immediate"
     assert settings_window.toggle_hotkey_edit.text() == "ctrl+shift+g"
-    assert settings_window.collect().journal.strategy == "sidecar"
 
 
 def test_watch_settings_round_trip(settings_window):
@@ -215,71 +223,58 @@ def test_watching_is_not_on_by_default_in_the_form(settings_window):
     assert settings_window.collect().capture.watch_on_launch is False
 
 
-def test_sidecar_fields_track_the_selected_strategy(settings_window):
-    settings_window.tool_call_radio.setChecked(True)
-    assert settings_window.sidecar_model_combo.isEnabled() is False
-
-    settings_window.sidecar_radio.setChecked(True)
-    assert settings_window.sidecar_model_combo.isEnabled() is True
-
-
-def test_restart_badge_appears_only_for_session_level_changes(settings_window):
+def test_restart_badge_names_only_the_affected_agent(settings_window):
     settings_window.opacity_slider.setValue(45)
     assert settings_window.restart_badge.text() == ""
 
-    settings_window.model_picker.choose("live/gemini-live-2.5-flash-preview")
-    assert "restart" in settings_window.restart_badge.text()
+    settings_window.observer_model_picker.choose("live/another-live-model")
+    assert "reconnect Observer" in settings_window.restart_badge.text()
+    assert "Responder" not in settings_window.restart_badge.text()
 
-
-def test_the_badge_says_when_a_save_changes_modes(settings_window):
-    settings_window.model_picker.choose("gemini/gemini-2.5-flash")
-    assert "switch modes" in settings_window.restart_badge.text()
+    settings_window.load(Settings())
+    settings_window.responder_mode_combo.setCurrentIndex(1)
+    assert "rebuild Responder" in settings_window.restart_badge.text()
+    assert "Observer" not in settings_window.restart_badge.text()
 
 
 # ------------------------------------------------------------ model picking
 
 
 def test_the_picker_returns_an_id_for_a_listed_model(settings_window):
-    picker = settings_window.model_picker
+    picker = settings_window.responder_model_picker
     picker.choose("gemini/gemini-2.5-flash")
 
     assert picker.selection() == "gemini/gemini-2.5-flash"
-    assert settings_window.collect().selected_model == "gemini/gemini-2.5-flash"
+    assert settings_window.collect().responder_model == "gemini/gemini-2.5-flash"
     assert "AI STUDIO" in picker.provider_label.text(), "the card says where it runs"
     assert picker.id_label.text() == "gemini/gemini-2.5-flash"
 
 
 def test_the_picker_accepts_a_model_it_has_never_heard_of(settings_window):
     """A catalogue fetched over the network cannot be the only way to name a model."""
-    settings_window.model_picker.choose("openrouter/some/model-from-today")
+    settings_window.responder_model_picker.choose("openrouter/some/model-from-today")
 
-    assert (
-        settings_window.collect().selected_model == "openrouter/some/model-from-today"
+    assert settings_window.collect().responder_model == (
+        "openrouter/some/model-from-today"
     )
-    assert "not in any catalogue" in settings_window.model_note_label.text()
+    assert "not in a catalogue" in settings_window.responder_note_label.text()
 
 
 def test_refreshing_the_catalogue_keeps_the_current_selection(settings_window):
     from chiron.models.catalogue import STATIC_MODELS
 
-    settings_window.model_picker.set_selection("openrouter/typed/by-hand")
+    settings_window.responder_model_picker.set_selection("openrouter/typed/by-hand")
     settings_window.set_models(list(STATIC_MODELS))
 
-    assert settings_window.collect().selected_model == "openrouter/typed/by-hand"
+    assert settings_window.collect().responder_model == "openrouter/typed/by-hand"
 
 
-def test_the_observer_picker_offers_no_live_models(settings_window):
-    picker = settings_window.observer_model_picker
-    ids = picker.model_ids()
-    assert ids, "the static list is not empty"
-    assert not any(str(i).startswith("live/") for i in ids)
-
-
-def test_the_card_shows_the_inherit_state_rather_than_looking_empty(settings_window):
-    picker = settings_window.observer_model_picker
-    picker.set_selection("")
-    assert "model chosen above" in picker.name_label.text()
-    assert picker.id_label.text() == ""
+def test_agent_pickers_are_disjoint(settings_window):
+    observer_ids = settings_window.observer_model_picker.model_ids()
+    responder_ids = settings_window.responder_model_picker.model_ids()
+    assert observer_ids and responder_ids
+    assert all(model_id.startswith("live/") for model_id in observer_ids)
+    assert all(not model_id.startswith("live/") for model_id in responder_ids)
 
 
 # ----------------------------------------------------------- picker search
@@ -422,7 +417,7 @@ def test_prices_are_rendered_per_million_tokens():
     from chiron.ui.model_picker import format_context, format_prices
 
     priced = next(m for m in STATIC_MODELS if m.pricing_known)
-    assert format_prices(priced) == "$0.30 / $2.50"
+    assert format_prices(priced) == "$1.50 / $7.50"
     assert format_prices(next(m for m in STATIC_MODELS if not m.pricing_known)) == (
         "no price"
     )
@@ -431,64 +426,64 @@ def test_prices_are_rendered_per_million_tokens():
     assert format_context(None) == ""
 
 
-# ------------------------------------------------------------- mode effects
+# --------------------------------------------------------- dual-agent effects
 
 
-def test_choosing_a_non_live_model_hides_frame_width(settings_window):
-    """Detail *is* the width there; two dials on the same pixels could disagree."""
+def test_frame_width_and_live_media_resolution_are_both_visible(settings_window):
     assert settings_window.frame_width_spin.isHidden() is False
-
-    settings_window.model_picker.choose("gemini/gemini-2.5-flash")
-
-    assert settings_window.frame_width_spin.isHidden() is True
-    assert "512 px" in settings_window.frame_width_note_label.text()
+    assert settings_window.media_res_combo.isHidden() is False
 
 
-def test_observer_settings_are_inert_under_a_live_model(settings_window):
-    assert settings_window.cooldown_spin.isEnabled() is False
-    assert "no observer" in settings_window.observer_mode_label.text()
-
-    settings_window.model_picker.choose("gemini/gemini-2.5-flash")
-
-    assert settings_window.cooldown_spin.isEnabled() is True
-    assert settings_window.gated_radio.isEnabled() is True
+def test_journal_memory_is_automatic_not_user_counted(settings_window):
+    assert not hasattr(settings_window, "fold_limit_spin")
+    assert not hasattr(settings_window, "max_entries_spin")
+    assert "ctx" in settings_window.journal_observer_context_label.text()
+    assert "ctx" in settings_window.journal_responder_context_label.text()
 
 
-def test_the_observer_model_only_matters_in_split_mode(settings_window):
-    settings_window.model_picker.choose("gemini/gemini-2.5-flash")
-    assert settings_window.observer_model_picker.isEnabled() is False
-
-    settings_window.split_radio.setChecked(True)
-    assert settings_window.observer_model_picker.isEnabled() is True
-    assert settings_window.collect().agent_mode == "split"
-
-
-def test_observer_settings_round_trip(settings_window):
-    settings = Settings(selected_model="gemini/gemini-2.5-flash")
-    settings.observer.trigger_strategy = "spike_plain_heartbeat"
-    settings.observer.cooldown_seconds = 45.0
-    settings.observer.spike_sensitivity = 4.5
-    settings.observer.max_frames_per_call = 5
-
+def test_dual_agent_fields_round_trip(settings_window):
+    settings = Settings(
+        observer_model="live/custom-observer",
+        responder_model="openrouter/openai/gpt-4o",
+        responder_mode="react",
+        observer_system_prompt="record objectives",
+        responder_system_prompt="avoid spoilers",
+    )
+    settings.capture.question_frame_policy = "immediate"
+    settings.capture.media_resolution = "high"
     settings_window.load(settings)
-    collected = settings_window.collect().observer
 
-    assert settings_window.plain_radio.isChecked()
-    assert collected.trigger_strategy == "spike_plain_heartbeat"
-    assert collected.cooldown_seconds == 45.0
-    assert collected.spike_sensitivity == pytest.approx(4.5)
-    assert collected.max_frames_per_call == 5
+    collected = settings_window.collect()
+    assert collected.observer_model == "live/custom-observer"
+    assert collected.responder_model == "openrouter/openai/gpt-4o"
+    assert collected.responder_mode == "react"
+    assert collected.observer_system_prompt == "record objectives"
+    assert collected.responder_system_prompt == "avoid spoilers"
+    assert collected.capture.question_frame_policy == "immediate"
+    assert collected.capture.media_resolution == "high"
 
 
-def test_the_burn_estimate_changes_meaning_with_the_mode(settings_window):
-    live = settings_window.burn_label.text()
-    assert "evicted" in live
+def test_react_filters_known_models_without_tools(settings_window):
+    from chiron.models.catalogue import ModelInfo
 
-    settings_window.model_picker.choose("gemini/gemini-2.5-flash")
-    non_live = settings_window.burn_label.text()
+    no_tools = ModelInfo(
+        id="gemini/vision-no-tools",
+        provider="google",
+        provider_model_id="vision-no-tools",
+        name="No tools",
+        vendor="vendor",
+        context_length=100_000,
+        prompt_price=0.0,
+        completion_price=0.0,
+        pricing_known=True,
+        supports_tools=False,
+        supports_vision=True,
+    )
+    settings_window.set_models([*settings_window._models, no_tools])
+    assert no_tools.id in settings_window.responder_model_picker.model_ids()
 
-    assert "buffered, not streamed" in non_live
-    assert non_live != live
+    settings_window.responder_mode_combo.setCurrentIndex(1)
+    assert no_tools.id not in settings_window.responder_model_picker.model_ids()
 
 
 def test_the_openrouter_key_round_trips(settings_window):
@@ -497,12 +492,23 @@ def test_the_openrouter_key_round_trips(settings_window):
 
 
 def test_token_estimate_reacts_to_the_shutter(settings_window):
-    settings_window.baseline_spin.setValue(4.0)
+    settings_window.interval_spin.setValue(4.0)
     fast = settings_window.burn_label.text()
-    settings_window.baseline_spin.setValue(20.0)
+    settings_window.interval_spin.setValue(20.0)
     slow = settings_window.burn_label.text()
     assert fast != slow
-    assert "tokens/min" in slow
+    assert "visual tokens/minute" in slow
+
+
+def test_privacy_page_warns_about_two_provider_screenshot_delivery(settings_window):
+    settings_window.nav.setCurrentRow(5)
+    text = " ".join(
+        label.text()
+        for label in settings_window.pages.currentWidget().findChildren(
+            type(settings_window.key_source_label)
+        )
+    )
+    assert "Google Live and OpenRouter" in text
 
 
 def test_key_source_is_reported(settings_window, monkeypatch):

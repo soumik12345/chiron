@@ -10,11 +10,6 @@ sees a slideshow with no inherent clock, and "the chest you saw earlier" is only
 groundable if each frame says when it was. Burning the time into the pixels gives
 the model an explicit *now* that survives into its context alongside the image.
 
-Each frame also carries a :attr:`Frame.signature`: a 32x32 greyscale thumbnail
-flattened to bytes. Comparing two signatures is a few hundred integer subtractions
-— cheap enough to run on every capture — and is what lets the scheduler notice a
-loading screen, a new area or a death screen and burst the shutter for the moments
-actually worth journaling.
 """
 
 from __future__ import annotations
@@ -22,15 +17,12 @@ from __future__ import annotations
 import io
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 from PIL import Image, ImageDraw
 
 logger = logging.getLogger(__name__)
-
-#: Edge length of the greyscale thumbnail used for scene-change comparison.
-SIGNATURE_SIZE = 32
 
 
 @dataclass(frozen=True)
@@ -42,14 +34,12 @@ class Frame:
         captured_at (float): Unix timestamp of the grab.
         width (int): Encoded width in pixels.
         height (int): Encoded height in pixels.
-        signature (bytes): Greyscale thumbnail used for scene-change detection.
     """
 
     jpeg: bytes
     captured_at: float
     width: int
     height: int
-    signature: bytes = field(default=b"", repr=False)
 
     @property
     def clock(self) -> str:
@@ -95,32 +85,6 @@ def stamp_timestamp(image: Image.Image, when: float) -> Image.Image:
     return stamped
 
 
-def frame_signature(image: Image.Image, size: int = SIGNATURE_SIZE) -> bytes:
-    """Return a tiny greyscale thumbnail of `image` as raw bytes."""
-    thumb = image.convert("L").resize((size, size), Image.Resampling.BILINEAR)
-    return thumb.tobytes()
-
-
-def signature_distance(left: bytes, right: bytes) -> float:
-    """Normalised 0-1 difference between two signatures.
-
-    Args:
-        left (bytes): A signature from :func:`frame_signature`.
-        right (bytes): Another signature of the same length.
-
-    Returns:
-        float: Mean absolute per-pixel difference divided by 255. Returns 0.0
-            when either side is empty and 1.0 when the lengths disagree (which
-            can only mean the signature size changed, i.e. everything is new).
-    """
-    if not left or not right:
-        return 0.0
-    if len(left) != len(right):
-        return 1.0
-    total = sum(abs(a - b) for a, b in zip(left, right))
-    return total / (len(left) * 255.0)
-
-
 def encode_frame(
     image: Image.Image,
     *,
@@ -139,13 +103,10 @@ def encode_frame(
         captured_at (float | None): Capture time; defaults to now.
 
     Returns:
-        Frame: The encoded frame, with its scene-change signature computed from
-            the downscaled (but unstamped) image so the stamp's own ticking
-            digits never register as a scene change.
+        Frame: The encoded frame.
     """
     when = time.time() if captured_at is None else captured_at
     scaled = downscale(image, width)
-    signature = frame_signature(scaled)
     final = stamp_timestamp(scaled, when) if stamp else scaled.convert("RGB")
 
     buffer = io.BytesIO()
@@ -155,7 +116,6 @@ def encode_frame(
         captured_at=when,
         width=final.width,
         height=final.height,
-        signature=signature,
     )
 
 
@@ -252,13 +212,10 @@ def describe_monitors() -> list[str]:
 
 
 __all__ = [
-    "SIGNATURE_SIZE",
     "Frame",
     "ScreenGrabber",
     "describe_monitors",
     "downscale",
     "encode_frame",
-    "frame_signature",
-    "signature_distance",
     "stamp_timestamp",
 ]

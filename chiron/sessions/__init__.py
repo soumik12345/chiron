@@ -18,18 +18,16 @@ Three modules, in dependency order:
 * :mod:`chiron.sessions.recorder` — :class:`~chiron.sessions.recorder.SessionRecorder`,
   the one object :class:`~chiron.app.ChironApp` owns. It observes the app through
   signals that already exist; it never participates, so it cannot block or break
-  gameplay, and it outlives the session provider across a live/non-live swap
-  exactly as the journal does.
+  gameplay, and it outlives Observer reconnects and Responder rebuilds.
 
-**Not to be confused with** :mod:`chiron.session` (singular), which is the
-*provider* seam — "how Chiron thinks" — and has nothing to do with persistence.
-A gameplay session spans many provider connections, many watch spans, and both
-modes if the player switches models mid-evening.
+**Not to be confused with** :mod:`chiron.session` (singular), which defines the
+two runtime agent contracts and has nothing to do with persistence. A gameplay
+session spans many Observer connections, Responder models, and watch spans.
 
 The on-disk format is deliberately replayable even though v2 does not replay it:
 ``journal_entry`` events fold back into a :class:`~chiron.journal.log.JournalLog`,
-``message`` events into the non-live history, ``compaction`` events as their
-summary. Resume is a v3 feature the format is already shaped for.
+``message`` events into canonical Responder memory, and ``compaction`` events as
+its active-context summary.
 """
 
 from __future__ import annotations

@@ -15,7 +15,6 @@ from PIL import Image
 
 from chiron.capture.frames import encode_frame
 from chiron.config.settings import OverlaySettings, Settings
-from chiron.journal.log import JournalEntry
 from chiron.models.usage import LLMCallRecord
 from chiron.sessions.store import SessionRow
 from chiron.ui.overlay import (
@@ -284,7 +283,8 @@ def test_watching_creates_a_session(app):
     app.set_watching(True)
 
     assert app.recorder.active is True
-    assert app.session.session_id == app.recorder.session_id
+    assert app.observer.session_id == app.recorder.session_id
+    assert app.responder.session_id == app.recorder.session_id
 
 
 def test_asking_a_question_creates_a_session(app):
@@ -310,7 +310,7 @@ async def test_a_watch_span_is_recorded_at_both_ends(app):
 
 def test_journal_entries_reach_the_record(app):
     app.set_watching(True)
-    app._on_journal_entry(JournalEntry(timestamp=time.time(), note="Lit the bonfire."))
+    app.journal_service.record("Lit the bonfire.", timestamp=time.time())
     app.recorder.flush()
 
     events = app.recorder.read_session(app.recorder.session_id)
@@ -336,7 +336,8 @@ def test_new_session_is_the_one_canonical_reset(app):
     app.new_session()
 
     assert len(app.journal) == 0
-    assert app.session.memory_resets == 1
+    assert app.observer.memory_resets == 1
+    assert app.responder.memory_resets == 1
     assert app.recorder.session_id != first
     assert app.recorder.index.get(first) is not None, "the record is kept, not deleted"
 
@@ -373,7 +374,8 @@ def test_a_compaction_is_recorded_and_announced(app):
 
     app._on_compacted(
         {
-            "mode": "nonlive",
+            "mode": "responder",
+            "agent_id": "responder",
             "tokens_before": 110000,
             "tokens_after": 20000,
             "summary": "s",
@@ -383,7 +385,7 @@ def test_a_compaction_is_recorded_and_announced(app):
 
     events = app.recorder.read_session(app.recorder.session_id)
     assert any(e.type == "compaction" for e in events)
-    assert "Summarised" in app.overlay.transcript.toHtml()
+    assert "summarised" in app.overlay.transcript.toHtml().lower()
 
 
 async def test_settings_changes_are_recorded_by_name(app):
@@ -481,14 +483,14 @@ def test_the_history_button_refreshes_from_the_index(app):
     assert app.overlay.picker.list.count() == 1
 
 
-def test_a_provider_swap_keeps_the_evening(app, monkeypatch):
-    """The record outlives the provider, exactly as the journal does."""
+def test_both_agents_share_the_evening_id(app):
     app.set_watching(True)
     session_id = app.recorder.session_id
 
     app._on_session_changed(session_id, "title")
 
-    assert app.session.session_id == session_id
+    assert app.observer.session_id == session_id
+    assert app.responder.session_id == session_id
 
 
 # ----------------------------------------------------------- fresh install

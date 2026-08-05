@@ -1,125 +1,77 @@
-"""The capture worker: a background thread that turns the screen into frames.
-
-Grabbing and JPEG-encoding a screen costs tens of milliseconds; doing it on the
-Qt thread would show up as a stuttering overlay on exactly the machine that is
-also running a game. So the shutter lives on its own thread, and finished frames
-cross back as Qt signals — queued automatically, because the service object
-itself belongs to the main thread.
-
-The thread does three things in a loop: ask the :class:`~chiron.capture.scheduler.AdaptiveScheduler`
-whether a frame is due, take one if it is, and compare it against the previous
-frame's signature to decide whether the world just changed enough to be worth
-bursting over. Settings can be replaced at any time from the UI thread; the loop
-picks up the new snapshot on its next pass.
-"""
+"""Fixed-interval screen capture with a cadence-neutral immediate path."""
 
 from __future__ import annotations
 
 import logging
 import threading
 import time
+from collections import deque
+from typing import Any
 
 from PySide6.QtCore import QObject, Signal
 
-from chiron.capture.frames import Frame, ScreenGrabber, encode_frame, signature_distance
-from chiron.capture.scheduler import AdaptiveScheduler
+from chiron.capture.frames import ScreenGrabber, encode_frame
+from chiron.capture.scheduler import FixedIntervalScheduler
 from chiron.config.settings import CaptureSettings
 
 logger = logging.getLogger(__name__)
 
-#: How long the loop sleeps between "is a frame due yet?" checks. Short enough
-#: that a burst requested by a question starts within a blink.
 _TICK_SECONDS = 0.05
-
-#: Consecutive grab failures tolerated before the service gives up and reports.
 _MAX_CONSECUTIVE_ERRORS = 5
 
 
 class CaptureService(QObject):
-    """Adaptive screen capture on a worker thread.
+    """Capture only while effective Watch is active.
 
-    Signals:
-        frameCaptured (object): A finished :class:`~chiron.capture.frames.Frame`.
-        sceneChanged (float): A hard scene change was detected, with its
-            normalised difference score.
-        modeChanged (str, str): The shutter switched between ``baseline`` and
-            ``burst``, with the reason for a burst (empty at baseline).
-        errorOccurred (str): Capture failed and the thread stopped.
-
-    Attributes:
-        settings (CaptureSettings): The snapshot the loop is currently using.
-        scheduler (AdaptiveScheduler): The shutter policy.
+    Scheduled frames use :attr:`frameCaptured`. An immediate question capture
+    uses :attr:`immediateFrameCaptured` with the caller's opaque token and does
+    not update :class:`FixedIntervalScheduler`.
     """
 
     frameCaptured = Signal(object)
-    sceneChanged = Signal(float)
-    modeChanged = Signal(str, str)
+    immediateFrameCaptured = Signal(object, object)
     errorOccurred = Signal(str)
 
     def __init__(
         self, settings: CaptureSettings, parent: QObject | None = None
     ) -> None:
-        """Create a stopped, not-yet-watching service configured by `settings`."""
         super().__init__(parent)
         self._lock = threading.Lock()
         self._settings = settings
         self._stop = threading.Event()
-        # Running and watching are different things. The thread may be alive and
-        # idle; only `_watching` decides whether the screen is ever read, and it
-        # starts false so launching Chiron never captures anything by itself.
         self._watching = threading.Event()
         self._thread: threading.Thread | None = None
-        self._last_signature: bytes = b""
-        self._last_mode: str = "baseline"
-        self.scheduler = AdaptiveScheduler(
-            baseline_interval=settings.baseline_interval_seconds,
-            burst_interval=settings.burst_interval_seconds,
-            burst_duration=settings.burst_duration_seconds,
-        )
+        self._immediate: deque[Any] = deque()
+        self.scheduler = FixedIntervalScheduler(settings.interval_seconds)
 
     @property
     def settings(self) -> CaptureSettings:
-        """The capture settings currently in force."""
         with self._lock:
             return self._settings
 
     @property
     def is_running(self) -> bool:
-        """Whether the worker thread is alive."""
         return self._thread is not None and self._thread.is_alive()
 
     @property
     def is_watching(self) -> bool:
-        """Whether the screen is actually being read."""
         return self._watching.is_set()
 
     def set_watching(self, watching: bool) -> None:
-        """Start or stop reading the screen.
-
-        The thread keeps running either way, so toggling costs nothing and the
-        next frame after a start arrives immediately rather than after a full
-        baseline interval.
-
-        Args:
-            watching (bool): True to capture, False to go idle.
-        """
         if watching == self.is_watching:
             return
         if watching:
             with self._lock:
-                # Forget the last frame, so the first frame after a pause is not
-                # diffed against whatever was on screen before it — that stale
-                # comparison would read as a scene change every single time.
-                self._last_signature = b""
-                self.scheduler.last_capture = None
-                self.scheduler.end_burst(time.time())
+                self.scheduler.reset()
+                self._immediate.clear()
             self._watching.set()
         else:
             self._watching.clear()
+            with self._lock:
+                self._immediate.clear()
         logger.info("Capture %s", "started" if watching else "stopped")
 
     def start(self) -> None:
-        """Start the capture thread if it is not already running."""
         if self.is_running:
             return
         self._stop.clear()
@@ -127,14 +79,8 @@ class CaptureService(QObject):
             target=self._run, name="chiron-capture", daemon=True
         )
         self._thread.start()
-        logger.info("Capture thread started")
 
     def stop(self, timeout: float = 2.0) -> None:
-        """Ask the thread to finish and wait briefly for it.
-
-        Args:
-            timeout (float): Seconds to wait for the thread to exit.
-        """
         self._stop.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
@@ -142,40 +88,23 @@ class CaptureService(QObject):
         self._thread = None
 
     def apply_settings(self, settings: CaptureSettings) -> None:
-        """Replace the settings the loop reads on its next pass.
-
-        Args:
-            settings (CaptureSettings): The new configuration. Scheduler timings
-                are updated in place so an in-flight burst is preserved.
-        """
         with self._lock:
             self._settings = settings
-            self.scheduler.baseline_interval = settings.baseline_interval_seconds
-            self.scheduler.burst_interval = settings.burst_interval_seconds
-            self.scheduler.burst_duration = settings.burst_duration_seconds
+            self.scheduler.interval_seconds = settings.interval_seconds
 
-    def request_burst(self, reason: str = "") -> None:
-        """Burst the shutter to 1 fps for the configured window.
-
-        Args:
-            reason (str): Short label ("question", "scene change") surfaced in
-                the overlay status line.
-        """
+    def request_immediate(self, token: Any = None) -> bool:
+        """Request exactly one extra capture without moving the periodic deadline."""
+        if not self.is_watching:
+            return False
         with self._lock:
-            self.scheduler.request_burst(time.time(), reason)
-        self._emit_mode()
+            self._immediate.append(token)
+        return True
 
-    def _emit_mode(self) -> None:
-        """Emit :attr:`modeChanged` when the shutter mode actually changed."""
+    def clear_pending(self) -> None:
         with self._lock:
-            mode = self.scheduler.mode(time.time())
-            reason = self.scheduler.burst_reason
-        if mode != self._last_mode:
-            self._last_mode = mode
-            self.modeChanged.emit(mode, reason)
+            self._immediate.clear()
 
     def _run(self) -> None:
-        """Worker loop: capture when due, diff, encode, emit."""
         grabber = ScreenGrabber(self.settings.monitor_index)
         errors = 0
         try:
@@ -187,13 +116,10 @@ class CaptureService(QObject):
                 now = time.time()
                 with self._lock:
                     settings = self._settings
-                    self.scheduler.expire_burst(now)
+                    immediate = bool(self._immediate)
+                    token = self._immediate.popleft() if immediate else None
                     due = self.scheduler.is_due(now)
-                    if due:
-                        self.scheduler.note_capture(now)
-                self._emit_mode()
-
-                if not due:
+                if not immediate and not due:
                     self._stop.wait(_TICK_SECONDS)
                     continue
 
@@ -207,7 +133,7 @@ class CaptureService(QObject):
                         captured_at=now,
                     )
                     errors = 0
-                except Exception as error:
+                except Exception as error:  # noqa: BLE001 - worker boundary
                     errors += 1
                     logger.warning("Screen capture failed (%d): %s", errors, error)
                     if errors >= _MAX_CONSECUTIVE_ERRORS:
@@ -216,22 +142,14 @@ class CaptureService(QObject):
                     self._stop.wait(1.0)
                     continue
 
-                self._handle_frame(frame, settings)
+                if immediate:
+                    self.immediateFrameCaptured.emit(frame, token)
+                else:
+                    with self._lock:
+                        self.scheduler.note_capture(now)
+                    self.frameCaptured.emit(frame)
         finally:
             grabber.close()
-            logger.info("Capture thread stopped")
-
-    def _handle_frame(self, frame: Frame, settings: CaptureSettings) -> None:
-        """Emit a captured frame and burst if the scene changed hard."""
-        if settings.scene_change_enabled and self._last_signature:
-            distance = signature_distance(self._last_signature, frame.signature)
-            if distance >= settings.scene_change_threshold:
-                self.sceneChanged.emit(distance)
-                with self._lock:
-                    self.scheduler.request_burst(frame.captured_at, "scene change")
-                self._emit_mode()
-        self._last_signature = frame.signature
-        self.frameCaptured.emit(frame)
 
 
 __all__ = ["CaptureService"]

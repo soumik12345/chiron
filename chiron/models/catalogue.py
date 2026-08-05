@@ -17,12 +17,11 @@ model family, and a Gemini model's price comes from chiron's own table or is mar
 unknown. :class:`ModelInfo` therefore carries ``pricing_known``: a picker that prints
 "Free" for a model it simply has no rate for is worse than one that prints nothing.
 
-**One Google fetch populates two providers.** ``supportedGenerationMethods`` is what
+**One Google fetch populates two agent catalogues.** ``supportedGenerationMethods``
 separates a Live API model (``bidiGenerateContent``) from an ordinary one
-(``generateContent``), and a model may support both — so :func:`list_google_models`
-can emit two entries for one model, one per mode, with ids that differ by prefix
-(``live/…`` versus ``gemini/…``). That is the whole of Chiron's mode selection: the
-picker lists both kinds and picking one decides which session provider runs.
+(``generateContent``). A model may support both, so :func:`list_google_models` can
+emit a ``live/…`` Observer entry and a ``gemini/…`` Responder entry for the same
+provider model.
 
 Everything here is best-effort: a failed fetch returns a stale cache if one exists
 and a small static list otherwise, so the picker is never empty and the settings UI
@@ -273,10 +272,8 @@ def _parse_google(entry: dict) -> list[ModelInfo]:
     """Build the :class:`ModelInfo` entries one raw ``v1beta/models`` entry implies.
 
     Usually one, occasionally two: a model that serves both ``generateContent``
-    and ``bidiGenerateContent`` is genuinely two choices — the same weights
-    reached through a websocket or through a completions call, with different
-    costs and a different session provider behind each — so the picker shows
-    both rather than silently deciding for the player.
+    and ``bidiGenerateContent`` is eligible for two different agent roles, with
+    different transports and costs.
 
     Returns an empty list for anything that can't hold a conversation at all —
     embedding models, answer-attribution models and the like — since a picker
@@ -418,10 +415,10 @@ STATIC_MODELS: list[ModelInfo] = [
         provider_model_id="gemini-3.6-flash",
         name="Gemini 3.6 Flash",
         vendor="google",
-        context_length=1_000_000,
-        prompt_price=0.0,
-        completion_price=0.0,
-        pricing_known=False,
+        context_length=1_048_576,
+        prompt_price=1.50 / 1_000_000,
+        completion_price=7.50 / 1_000_000,
+        pricing_known=True,
         supports_tools=True,
     ),
     ModelInfo(
@@ -475,9 +472,9 @@ def available_models(
         force (bool): Skip the disk caches and re-fetch.
 
     Returns:
-        list[ModelInfo]: Live entries first (they are what Chiron was built
-            around), then non-live ones. Falls back to :data:`STATIC_MODELS`
-            when no provider yielded anything at all.
+        list[ModelInfo]: Live Observer entries followed by non-live Responder
+            entries. Falls back to applicable static entries when catalogue
+            fetches yield nothing.
     """
     models: list[ModelInfo] = list(
         list_google_models(google_key, force=force) if google_key else []
@@ -487,13 +484,17 @@ def available_models(
             m for m in list_models(force=force) if m.supports_vision and not m.is_live
         )
     if not models:
-        return list(STATIC_MODELS)
+        return [
+            model
+            for model in STATIC_MODELS
+            if model.provider != OPENROUTER or bool(openrouter_key)
+        ]
     models.sort(key=lambda m: (not m.is_live, m.provider, m.vendor.lower(), m.id))
     return models
 
 
-def cached_context_length(model_id: str) -> int | None:
-    """The model's context window from the disk caches only — never the network.
+def cached_context_length_info(model_id: str) -> tuple[int, str] | None:
+    """The model's context window and provenance without touching the network.
 
     Compaction asks this before every question, so it must be cheap and offline:
     a blocking HTTP request on the path between a player pressing Enter and an
@@ -504,26 +505,61 @@ def cached_context_length(model_id: str) -> int | None:
         model_id (str): The litellm id to look up.
 
     Returns:
-        int | None: The window in tokens, or None when no cache knows it.
+        tuple[int, str] | None: Tokens plus a human-readable source, or None.
     """
     target = (model_id or "").strip()
     if not target:
         return None
     forever = 2**31
-    for cache_path in (_GOOGLE_CACHE, _OPENROUTER_CACHE):
+    for cache_path, source in (
+        (_GOOGLE_CACHE, "Google catalogue"),
+        (_OPENROUTER_CACHE, "OpenRouter catalogue"),
+    ):
         for model in _read_cache(cache_path, ttl=forever) or []:
             if model.id == target and model.context_length:
-                return int(model.context_length)
+                return int(model.context_length), source
     for model in STATIC_MODELS:
         if model.id == target and model.context_length:
-            return int(model.context_length)
+            return int(model.context_length), "bundled metadata"
     return None
+
+
+def cached_context_length(model_id: str) -> int | None:
+    """The cached context length alone, retained for simple callers."""
+    resolved = cached_context_length_info(model_id)
+    return resolved[0] if resolved is not None else None
 
 
 def find_model(models: list[ModelInfo], model_id: str) -> ModelInfo | None:
     """The entry for `model_id`, or None when the catalogue has never heard of it."""
     target = (model_id or "").strip()
     return next((m for m in models if m.id == target), None)
+
+
+def observer_models(models: list[ModelInfo]) -> list[ModelInfo]:
+    """Gemini Live entries that can be selected for Chiron-Observer."""
+    return [model for model in models if model.is_live and model.provider == LIVE]
+
+
+def responder_models(
+    models: list[ModelInfo], *, mode: str = "fixed_horizon"
+) -> list[ModelInfo]:
+    """Non-live multimodal entries suitable for Chiron-Responder.
+
+    Known tool-incompatible models are excluded in ReAct mode. Unknown custom
+    ids are handled by :func:`describe_unknown` in the picker and remain
+    selectable with a warning.
+    """
+    candidates = [
+        model
+        for model in models
+        if not model.is_live
+        and model.supports_vision
+        and model.provider in {GOOGLE, OPENROUTER}
+    ]
+    if mode == "react":
+        candidates = [model for model in candidates if model.supports_tools]
+    return candidates
 
 
 def describe_unknown(model_id: str) -> ModelInfo:
@@ -554,9 +590,12 @@ __all__ = [
     "ModelInfo",
     "available_models",
     "cached_context_length",
+    "cached_context_length_info",
     "describe_unknown",
     "find_model",
     "list_google_models",
     "list_models",
+    "observer_models",
+    "responder_models",
     "to_litellm_id",
 ]

@@ -1,56 +1,15 @@
-"""The journal log and both writer strategies."""
+"""The one journal write path and immutable Responder snapshot."""
 
 from __future__ import annotations
 
-from typing import Any
-
-import pytest
-
-from chiron.config.settings import JournalSettings
 from chiron.journal.log import JournalLog
-from chiron.journal.writers import (
-    SidecarJournal,
-    ToolCallJournal,
-    build_journal_writer,
-    parse_sidecar_entries,
-)
-
-
-class FakeModel:
-    """Stands in for LiteLLMModel, recording what it was asked."""
-
-    def __init__(self, reply: str) -> None:
-        self.reply = reply
-        self.calls: list[list[dict[str, Any]]] = []
-
-    async def acompletion(self, messages, tools=None, stream=False):
-        self.calls.append(messages)
-
-        class _Message:
-            content = self.reply
-
-        class _Choice:
-            message = _Message()
-
-        class _Response:
-            choices = [_Choice()]
-            usage = None
-
-        return _Response()
-
-    def record_usage(self, usage, response=None, context=None):
-        return {}
-
-
-# ------------------------------------------------------------------- the log
+from chiron.journal.service import JournalService
 
 
 def test_append_and_render():
     log = JournalLog()
     log.append("Entered Firelink Shrine.", category="location", timestamp=1_700_000_000)
-    rendered = log.render()
-    assert "[location]" in rendered
-    assert "Entered Firelink Shrine." in rendered
+    assert "[location]" in log.render()
     assert len(log) == 1
 
 
@@ -60,159 +19,112 @@ def test_blank_notes_are_dropped():
     assert len(log) == 0
 
 
-def test_trimming_keeps_the_newest():
-    log = JournalLog(max_entries=3)
-    for index in range(6):
+def test_raw_journal_is_lossless_in_active_memory():
+    log = JournalLog()
+    for index in range(600):
         log.append(f"event {index}")
-    assert len(log) == 3
-    assert log.entries[0].note == "event 3"
+    assert len(log.snapshot()) == 600
+    assert log.snapshot()[0].note == "event 0"
 
 
-def test_fold_tracking():
-    log = JournalLog()
-    log.append("first")
-    assert [e.note for e in log.unfolded()] == ["first"]
-
-    log.mark_folded()
-    assert log.unfolded() == []
-
-    log.append("second")
-    assert [e.note for e in log.unfolded()] == ["second"]
-
-
-def test_trimming_does_not_resurrect_folded_entries():
-    log = JournalLog(max_entries=2)
-    log.append("a")
-    log.append("b")
-    log.mark_folded()
-    log.append("c")
-    assert [e.note for e in log.unfolded()] == ["c"]
-
-
-def test_clear_resets_fold_state():
+def test_clear_removes_all_entries():
     log = JournalLog()
     log.append("a")
-    log.mark_folded()
     log.clear()
     assert len(log) == 0
-    assert log.unfolded() == []
 
 
-# --------------------------------------------------------------- tool-call
-
-
-async def test_tool_call_journal_records_events():
-    log = JournalLog()
+def test_service_records_and_notifies_once():
     seen = []
-    writer = ToolCallJournal(log, seen.append)
+    service = JournalService(JournalLog(), seen.append)
+    entry = service.record("Died to the skeleton.", "death")
+    assert entry is not None
+    assert entry.source == "observer"
+    assert [item.note for item in seen] == ["Died to the skeleton."]
+    assert len(service.log) == 1
 
-    declarations = writer.function_declarations()
-    assert declarations[0]["name"] == "record_event"
 
-    result = await writer.handle_tool_call(
-        "record_event", {"note": "Died to the skeleton.", "category": "death"}
+async def test_observer_tool_is_the_only_write_handler():
+    service = JournalService(JournalLog())
+    declaration = service.function_declarations
+    assert [item["name"] for item in declaration] == ["record_event"]
+
+    result = await service.handle_observer_tool(
+        "record_event", {"note": "Found the lift key.", "category": "item"}
     )
+    rejected = await service.handle_observer_tool("launch_missiles", {})
     assert result["status"] == "recorded"
-    assert log.entries[0].category == "death"
-    assert log.entries[0].source == "tool_call"
-    assert len(seen) == 1
+    assert "error" in rejected
+    assert len(service.log) == 1
 
 
-async def test_tool_call_journal_rejects_unknown_functions():
-    writer = ToolCallJournal(JournalLog())
-    result = await writer.handle_tool_call("launch_missiles", {})
-    assert "error" in result
-
-
-async def test_tool_call_journal_ignores_empty_notes():
-    log = JournalLog()
-    writer = ToolCallJournal(log)
-    result = await writer.handle_tool_call("record_event", {"note": ""})
+async def test_empty_observer_tool_note_is_ignored():
+    service = JournalService(JournalLog())
+    result = await service.handle_observer_tool("record_event", {"note": " "})
     assert result["status"] == "ignored"
-    assert len(log) == 0
+    assert len(service.log) == 0
 
 
-# ----------------------------------------------------------------- sidecar
+def test_snapshot_is_immutable_and_does_not_follow_later_writes():
+    service = JournalService(JournalLog())
+    service.record("first")
+    snapshot = service.snapshot()
+    service.record("second")
+    assert len(snapshot) == 1
+    assert "first" in snapshot.render()
+    assert "second" not in snapshot.render()
 
 
-def test_sidecar_declares_no_functions():
-    writer = SidecarJournal(JournalLog(), JournalSettings(strategy="sidecar"))
-    assert writer.function_declarations() == []
+def test_summary_changes_model_view_without_deleting_raw_entries():
+    service = JournalService(JournalLog())
+    for note in ("first", "second", "third"):
+        service.record(note)
+
+    service.apply_summary("The first two events happened.", 2)
+    snapshot = service.snapshot()
+
+    assert len(snapshot) == 3
+    assert snapshot.summarized_entries == 2
+    assert [entry.note for entry in snapshot.entries] == ["third"]
+    assert "The first two events happened." in snapshot.render()
+    assert [entry.note for entry in service.log.snapshot()] == [
+        "first",
+        "second",
+        "third",
+    ]
 
 
-async def test_sidecar_summarises_the_transcript():
-    log = JournalLog()
-    model = FakeModel(
-        '{"entries": [{"category": "location", "note": "Entered the Undead Parish."}]}'
-    )
-    writer = SidecarJournal(log, JournalSettings(strategy="sidecar"), model=model)
-    writer.observe_user_message("where am I?")
-    writer.observe_model_message("The Undead Parish, by the look of the architecture.")
-
-    entries = await writer.summarise_once()
-
-    assert [e.note for e in entries] == ["Entered the Undead Parish."]
-    assert log.entries[0].source == "sidecar"
-    assert "where am I?" in str(model.calls[0][1]["content"])
+def test_clear_resets_raw_and_summarized_memory():
+    service = JournalService(JournalLog())
+    service.record("first")
+    service.apply_summary("Earlier memory", 1)
+    service.clear()
+    assert service.snapshot().render() == ""
+    assert len(service.log) == 0
 
 
-async def test_sidecar_does_nothing_when_nothing_happened():
-    model = FakeModel("{}")
-    writer = SidecarJournal(
-        JournalLog(), JournalSettings(strategy="sidecar"), model=model
-    )
-    assert await writer.summarise_once() == []
-    assert model.calls == []
+def test_summary_from_a_cancelled_old_session_cannot_contaminate_new_memory():
+    service = JournalService(JournalLog())
+    service.record("old session")
+    generation = service.snapshot().generation
+    service.clear()
+
+    applied = service.apply_summary("stale result", 1, generation=generation)
+
+    assert applied is False
+    assert service.snapshot().render() == ""
 
 
-async def test_sidecar_sends_kept_frames():
-    from PIL import Image
-
-    from chiron.capture.frames import encode_frame
-
-    model = FakeModel('{"entries": []}')
-    writer = SidecarJournal(
-        JournalLog(),
-        JournalSettings(strategy="sidecar", sidecar_frame_count=2),
-        model=model,
-    )
-    for _ in range(3):
-        writer.observe_frame(encode_frame(Image.new("RGB", (64, 36))))
-
-    await writer.summarise_once()
-
-    content = model.calls[0][1]["content"]
-    images = [part for part in content if part["type"] == "image_url"]
-    assert len(images) == 2, "only the most recent frames are kept"
-    assert images[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+def test_responder_reader_exposes_no_write_operation():
+    service = JournalService(JournalLog())
+    reader = service.reader()
+    assert hasattr(reader, "snapshot")
+    assert not hasattr(reader, "record")
+    assert not hasattr(reader, "handle_observer_tool")
 
 
-@pytest.mark.parametrize(
-    "reply,expected",
-    [
-        ('{"entries": [{"note": "a", "category": "item"}]}', [("a", "item")]),
-        ('```json\n{"entries": [{"note": "b"}]}\n```', [("b", "note")]),
-        ('Sure!\n{"entries": [{"note": "c"}]}\nHope that helps.', [("c", "note")]),
-        ('{"entries": ["d"]}', [("d", "note")]),
-        ('{"entries": []}', []),
-        ("not json at all", []),
-        ("", []),
-        ('{"entries": [{"note": "   "}]}', []),
-    ],
-)
-def test_sidecar_reply_parsing(reply, expected):
-    assert parse_sidecar_entries(reply) == expected
-
-
-# ------------------------------------------------------------------ factory
-
-
-def test_factory_picks_the_configured_strategy():
-    log = JournalLog()
-    assert isinstance(
-        build_journal_writer(JournalSettings(strategy="tool_call"), log),
-        ToolCallJournal,
-    )
-    assert isinstance(
-        build_journal_writer(JournalSettings(strategy="sidecar"), log), SidecarJournal
-    )
+def test_application_entries_take_the_same_notification_path():
+    seen = []
+    service = JournalService(JournalLog(), seen.append)
+    service.record("The player switched to Hades.", source="system")
+    assert seen[0].source == "system"

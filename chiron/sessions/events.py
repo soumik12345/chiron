@@ -13,12 +13,12 @@ The types divide into three families:
   ``settings_changed``. Sessions and watching are independent axes: one session
   spans many watch spans, and without ``settings_changed`` the cost data is
   uninterpretable a week later.
-* **Content** — ``message``, ``journal_entry``, ``observer_run``, ``frame``,
-  ``compaction``. This is what the viewer renders and what a future resume folds
-  back into a live provider.
+* **Content** — ``message``, ``journal_entry``, ``frame``, ``compaction`` and
+  ``agent_trace``. Legacy ``observer_run`` records remain readable but are no
+  longer emitted.
 * **Money** — ``llm_call``, one serialised
   :class:`~chiron.models.usage.LLMCallRecord` per call, linked by ``call_id``
-  from the ``message``, ``observer_run`` or ``compaction`` that caused it.
+  from the attributed agent activity that caused it.
 
 Payloads are plain JSON dicts rather than per-type models on purpose. A reader
 five versions from now has to tolerate fields it has never heard of and fields
@@ -47,6 +47,7 @@ EventType = Literal[
     "compaction",
     "status",
     "settings_changed",
+    "agent_trace",
 ]
 
 #: The vocabulary as a tuple, for validation and for tests that assert the
@@ -65,16 +66,16 @@ EVENT_TYPES: tuple[str, ...] = (
     "compaction",
     "status",
     "settings_changed",
+    "agent_trace",
 )
 
-#: Why a frame was kept. ``question`` rode with a player question, ``observer``
-#: with an observer tick, ``burst`` is a live-mode frame streamed to the socket.
-FrameReason = Literal["question", "observer", "burst"]
+#: Why a frame was kept. New v3 records use ``question``, ``scheduled`` and
+#: ``immediate``; ``observer`` and ``burst`` remain for old-session readers.
+FrameReason = Literal["question", "observer", "burst", "scheduled", "immediate"]
 
-#: How memory was consolidated. ``nonlive`` summarised history in place;
-#: ``live_rotate`` folded the journal and reconnected without the resumption
-#: handle, which is the only compaction a server-side context allows.
-CompactionMode = Literal["nonlive", "live_rotate"]
+#: How memory was consolidated. New records use ``responder`` and
+#: ``observer_rotate``; ``nonlive`` and ``live_rotate`` remain readable.
+CompactionMode = Literal["nonlive", "live_rotate", "responder", "observer_rotate"]
 
 
 class SessionEvent(BaseModel):
@@ -106,9 +107,8 @@ def session_meta(
 ) -> dict[str, Any]:
     """The opening line: who this session is and what it started as.
 
-    ``mode`` is the mode *at creation*. A session that starts live and ends
-    non-live is a real thing that happens, and the ``settings_changed`` events
-    are what tell that story — overwriting this field would lose the beginning.
+    ``mode`` is the topology at creation. v3 writes ``dual_agent`` while old
+    ``live`` and ``nonlive`` values remain valid historical data.
     """
     return {
         "id": session_id,
@@ -136,9 +136,11 @@ def game(*, label: str, identity: str = "", described: str = "") -> dict[str, An
     return {"label": label, "identity": identity, "described": described or label}
 
 
-def status(*, status: str, detail: str = "") -> dict[str, Any]:
+def status(
+    *, status: str, detail: str = "", agent_id: str | None = None
+) -> dict[str, Any]:
     """A provider status transition, from the shared status vocabulary."""
-    return {"status": status, "detail": detail}
+    return {"status": status, "detail": detail, "agent_id": agent_id}
 
 
 def settings_changed(*, fields: list[str], mode: str) -> dict[str, Any]:
@@ -159,6 +161,7 @@ def message(
     text: str,
     frames: list[str] | None = None,
     call_id: str | None = None,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
     """One turn of the conversation.
 
@@ -172,6 +175,7 @@ def message(
         "text": text,
         "frames": list(frames or []),
         "call_id": call_id,
+        "agent_id": agent_id,
     }
 
 
@@ -192,34 +196,6 @@ def journal_entry(
     }
 
 
-def observer_run(
-    *,
-    reason: str,
-    frames: list[str] | None = None,
-    entries: int = 0,
-    call_id: str | None = None,
-    skipped: bool = False,
-) -> dict[str, Any]:
-    """One observer tick — the agent trace of non-live mode.
-
-    Args:
-        reason (str): What made it due ("scene change", "heartbeat", "drift").
-        frames (list[str] | None): Thumbnail ids the observer was shown.
-        entries (int): How many journal entries it produced. Zero is the common
-            and correct answer, and recording it is what makes the trigger
-            policy auditable after the fact.
-        call_id (str | None): The ``llm_call`` this run paid for.
-        skipped (bool): True when the trigger decided against calling at all.
-    """
-    return {
-        "reason": reason,
-        "frames": list(frames or []),
-        "entries": entries,
-        "call_id": call_id,
-        "skipped": skipped,
-    }
-
-
 def frame(
     *,
     frame_id: str,
@@ -228,6 +204,7 @@ def frame(
     height: int,
     reason: str,
     thumbnail: str,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
     """A frame that reached a model, and why it was kept.
 
@@ -242,6 +219,7 @@ def frame(
         "height": height,
         "reason": reason,
         "thumbnail": thumbnail,
+        "agent_id": agent_id,
     }
 
 
@@ -255,6 +233,7 @@ def compaction(
     dropped_count: int = 0,
     reason: str = "",
     call_id: str | None = None,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
     """Memory was deliberately consolidated.
 
@@ -271,7 +250,13 @@ def compaction(
         "dropped_count": dropped_count,
         "reason": reason,
         "call_id": call_id,
+        "agent_id": agent_id,
     }
+
+
+def agent_trace(*, agent_id: str, event: Any) -> dict[str, Any]:
+    """One diagnostic ReAct event, intentionally outside the transcript."""
+    return {"agent_id": agent_id, "event": event}
 
 
 __all__ = [
@@ -280,12 +265,12 @@ __all__ = [
     "EventType",
     "FrameReason",
     "SessionEvent",
+    "agent_trace",
     "compaction",
     "frame",
     "game",
     "journal_entry",
     "message",
-    "observer_run",
     "session_meta",
     "settings_changed",
     "status",

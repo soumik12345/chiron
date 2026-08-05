@@ -1,18 +1,16 @@
-"""What a live session costs, by arithmetic rather than by measurement.
+"""What the Live Observer costs, by arithmetic rather than measurement.
 
-Every non-live call in Chiron goes through litellm, which reports token counts
-and — on OpenRouter — the real charge. The Live API reports neither in a shape
-that can be billed from: it is a websocket carrying audio, video and
-transcription, and the ``usage_metadata`` it does send is a running context total
-rather than a per-call invoice.
+Every Responder call goes through litellm, which reports token counts and—on
+OpenRouter—the real charge. The Live API reports no equivalent per-checkpoint
+invoice; its ``usage_metadata`` is a running context total.
 
 So live-mode rows are **estimates**, and this module is the whole of the estimate:
 
 * frames sent, times the per-frame token cost implied by the selected frame
   detail (the same figure the settings page's eviction estimate uses);
-* the player's questions and the model's transcribed speech, at the usual
-  characters ÷ 4;
-* against a small hand-kept table of Live API rates.
+* checkpoint instructions and journal seed/rotation traffic at characters ÷ 4;
+* discarded 24 kHz, 16-bit PCM output at roughly 25 audio tokens/second;
+* all priced against a small hand-kept table of Live API rates.
 
 Every record it produces carries ``pricing_source="estimated"``, which is what
 makes the ``~`` in front of the footer's total honest rather than decorative. The
@@ -41,6 +39,12 @@ TOKENS_PER_FRAME: dict[str, int] = {"low": 260, "medium": 560, "high": 1120}
 
 #: Characters per token for the text sides of the estimate.
 CHARS_PER_TOKEN = 4
+
+#: Live output is raw mono 24 kHz, 16-bit PCM. Google's Live guidance says audio
+#: accumulates at about 25 tokens/second, so byte duration gives us a better
+#: estimate than treating an entire audio chunk as a few characters of text.
+AUDIO_OUTPUT_BYTES_PER_SECOND = 24_000 * 2
+AUDIO_TOKENS_PER_SECOND = 25
 
 _M = 1_000_000
 
@@ -85,6 +89,19 @@ def text_tokens(text: str) -> int:
     return max(1, (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN)
 
 
+def audio_output_tokens(byte_count: int) -> int:
+    """Estimate Live audio tokens from raw 24 kHz, 16-bit PCM bytes."""
+    size = max(0, int(byte_count))
+    if not size:
+        return 0
+    numerator = size * AUDIO_TOKENS_PER_SECOND
+    return max(
+        1,
+        (numerator + AUDIO_OUTPUT_BYTES_PER_SECOND - 1)
+        // AUDIO_OUTPUT_BYTES_PER_SECOND,
+    )
+
+
 def estimate_turn(
     *,
     model_id: str,
@@ -92,30 +109,36 @@ def estimate_turn(
     media_resolution: str,
     prompt_text: str = "",
     output_text: str = "",
+    output_tokens: int = 0,
     session_id: str | None = None,
     started_at: str | None = None,
     duration_ms: int | None = None,
+    agent_id: str | None = None,
+    kind: str = "observer_checkpoint",
 ) -> LLMCallRecord:
-    """Price one live model turn, as an estimate.
+    """Price one Observer checkpoint or context write, as an estimate.
 
     Args:
         model_id (str): The Live model id, with or without the ``live/`` prefix.
         frames (int): Frames streamed since the previous turn.
         media_resolution (str): The frame-detail setting in force.
         prompt_text (str): Text the player sent since the previous turn.
-        output_text (str): The transcript of what the model said.
+        output_text (str): Tool/content text produced by the model.
+        output_tokens (int): Additional estimated output tokens, notably discarded
+            native audio calculated from its PCM byte duration.
         session_id (str | None): The gameplay session to bill this to.
         started_at (str | None): ISO-8601 UTC start; defaults to now.
         duration_ms (int | None): Wall-clock duration, when known.
 
     Returns:
         LLMCallRecord: A ledger row tagged ``pricing_source="estimated"`` and
-            ``kind="live_turn"``, so no surface can render it as measured.
+            ``kind="observer_checkpoint"``, so no surface can render it as
+            measured.
     """
     prompt_tokens = frames * tokens_per_frame(media_resolution) + text_tokens(
         prompt_text
     )
-    completion_tokens = text_tokens(output_text)
+    completion_tokens = text_tokens(output_text) + max(0, int(output_tokens))
     pricing = live_pricing(model_id)
     breakdown = pricing.cost_breakdown(
         prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
@@ -123,7 +146,8 @@ def estimate_turn(
     _, _, bare = split_model_id(model_id)
     return LLMCallRecord(
         session_id=session_id,
-        kind="live_turn",
+        agent_id=agent_id,
+        kind=kind,
         model_id=model_id,
         model=bare,
         route="live",
@@ -181,8 +205,11 @@ def read_usage_metadata(message: Any) -> int | None:
 
 
 __all__ = [
+    "AUDIO_OUTPUT_BYTES_PER_SECOND",
+    "AUDIO_TOKENS_PER_SECOND",
     "CHARS_PER_TOKEN",
     "TOKENS_PER_FRAME",
+    "audio_output_tokens",
     "call_timer",
     "estimate_context_tokens",
     "estimate_turn",

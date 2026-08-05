@@ -9,14 +9,16 @@ answers with the current scene and the recent history of your play session in
 mind. It is meant to feel less like a chatbot beside the game and more like a
 friend looking over your shoulder—one who stays quiet until invited in.
 
-Chiron is currently an early Linux/X11 project powered by the
-[Google Gemini Live API](https://ai.google.dev/gemini-api/docs/live-api).
+Chiron is currently an early Linux/X11 project with two deliberately separate
+agents: a Gemini Live Observer that watches and journals, and a request/response
+Responder that produces every answer.
 
 ## What it does
 
 - Lives in a frameless, always-on-top panel that can be moved and resized.
-- Captures your screen adaptively instead of streaming it continuously.
-- Answers typed questions using the newest frames and your recent conversation.
+- Captures at a fixed interval while the Live Observer is connected.
+- Answers typed questions through a separately selected Gemini or OpenRouter
+  Responder, using the current frame, journal, and conversation.
 - Keeps a lightweight journal of notable events so useful context can outlive
   old screenshots and connection changes.
 - Starts idle. Chiron does not capture or send screenshots until you explicitly
@@ -33,7 +35,8 @@ You will need:
 - Linux running X11 (GNOME on Ubuntu is the currently tested setup)
 - Python 3.10 or newer
 - [uv](https://docs.astral.sh/uv/)
-- A Gemini API key
+- A Gemini API key (required for the Live Observer and Gemini Responders)
+- Optionally, an OpenRouter key for OpenRouter Responder models
 
 Install the dependencies from the repository root:
 
@@ -78,20 +81,29 @@ brings it back — while `✕` shuts it down for real.
 Drag the header to move the panel and use the corner grip to resize it. Type a
 question in the input field whenever you want help.
 
-Stopping watching closes the Live session as well as pausing capture. The
-in-memory journal remains available, so you can still ask about earlier events
-and Chiron can use them when watching resumes. If you prefer it to begin watching
-immediately, enable **Start watching as soon as Chiron opens** under
-**Settings → Capture**.
+Turning Watch on first connects Chiron-Observer; capture does not begin until it
+reports `live`. If the socket drops, capture stops and cached frames are cleared
+while bounded reconnects continue. Chiron-Responder can still answer from the
+existing journal and conversation, and is told explicitly that those observations
+may be stale.
+
+Stopping Watch closes the Observer socket but leaves the current gameplay
+session available for journal-only questions. If you prefer it to begin watching
+immediately, enable **Start Watch on launch** under **Settings → Capture**.
 
 ## A note on privacy
 
-The boundary is deliberately simple: “not watching” means no screenshots are
-taken and no Live session is open. Chiron launches in that state by default.
+The boundary is deliberately simple: no screenshot is taken unless Watch is
+requested and Chiron-Observer is connected. Chiron launches with Watch off.
 
-Settings, including a saved API key, are stored with owner-only permissions in
-`~/.config/chiron/settings.json`. The journal is currently held only in memory
-and disappears when the application exits.
+With an OpenRouter Responder, a screenshot attached to a question is sent to
+both Google Live (Observer) and OpenRouter (Responder). The Settings privacy page
+calls this out before you choose that topology.
+
+Settings, including saved API keys, are stored with owner-only permissions in
+`~/.config/chiron/settings.json`. Gameplay sessions—including the journal,
+transcript, traces, costs, and model-frame thumbnails—are stored under
+`~/.local/share/chiron/sessions/` and can be browsed in the overlay.
 
 To remove Chiron's saved configuration and API key:
 
@@ -100,38 +112,32 @@ uv run chiron --fresh-install
 ```
 
 Chiron prints what it plans to remove and asks for confirmation. For a
-non-interactive invocation, add `--yes`. Files it did not create are left alone.
+non-interactive invocation, add `--yes`. Recorded gameplay sessions are in the
+data directory and are deliberately not removed by `--fresh-install`.
 
 ## How the memory works
 
-Raw screenshots make good short-term memory but poor long-term memory. They are
-large, and the Live model eventually has to discard older frames. Chiron turns
-important moments into compact timestamped journal entries and periodically
-feeds those notes back into the conversation.
+Raw screenshots make good short-term evidence but poor durable memory. Every five
+seconds by default, Chiron gives the Live Observer one frame inside an explicit
+activity boundary. The Observer can call only `record_event`; its audio and
+content output are discarded. Durable progress, objectives, locations, items,
+and decisions enter one shared journal write path.
 
-There are two journal strategies in Settings:
+The Responder has read-only journal access. Fixed-horizon mode injects journal
+memory and normally uses one completion. ReAct mode exposes only `read_journal`
+and structurally forces a successful read before a final answer. Both modes share
+one canonical user/final-answer conversation. When either journal or conversation
+context grows, older material is summarized for the active prompt while every raw
+journal entry and canonical conversation turn remains intact.
 
-- **In-session tool call:** the Live model records notable events itself. This
-  needs no extra model call, but journaling shares the model's attention with the
-  conversation.
-- **Sidecar summarizer:** a separate, cheaper model periodically distills recent
-  frames and conversation. It keeps the jobs separate but makes additional API
-  calls.
-
-Capture follows the same “use only what matters” approach. Chiron takes a frame
-roughly every four seconds while the scene is calm, then briefly increases to
-one frame per second after a question or a substantial scene change. The timing,
-image quality, scene detection, and monitor can all be adjusted in Settings.
-
-Although the interface is text-in and text-out, currently available Gemini Live
-models produce native audio. Chiron requests the model's output transcription,
-shows that text, and discards the audio without playing it. This means responses
-are billed by Gemini as audio output tokens.
+Questions use the latest frame by default. The optional immediate policy takes
+exactly one extra frame, sends the same image to both agents, and does not shift
+the periodic deadline. There is no client-side scene detection, novelty trigger,
+heartbeat, or burst mode.
 
 ## Current limits
 
 - X11 is supported; Wayland capture and global shortcuts are not yet wired up.
-- The journal does not persist between application runs.
 - There is no game-wiki retrieval or cross-session memory yet.
 - Chiron responds only when asked and does not offer proactive coaching.
 - Generated answers can be mistaken. Treat them as guidance, especially when a
@@ -139,10 +145,12 @@ are billed by Gemini as audio output tokens.
 
 ## Configuration and command-line options
 
-Most configuration lives in the settings window: model and API key, capture
-behavior, journal strategy, overlay appearance, and hotkeys. Appearance changes
-preview immediately; changes that affect the Live session reconnect it after
-you save.
+Most configuration lives in the settings window: separate Observer and Responder
+models, Responder mode, credentials, fixed capture behavior, overlay appearance,
+and hotkeys. Journal memory is token-budgeted automatically from the selected
+models' reported context windows. Appearance and cadence changes apply directly;
+Observer configuration reconnects only the Observer, while Responder changes
+rebuild only the Responder and preserve its conversation.
 
 Useful launch options:
 
@@ -170,11 +178,15 @@ is the only worker thread; it hands encoded frames back through Qt signals.
 ```text
 chiron/
 ├── app.py          # application lifecycle and component wiring
-├── capture/        # screenshots, encoding, and adaptive scheduling
+├── capture/        # screenshots, encoding, and fixed scheduling
 ├── config/         # settings model and persistence
-├── journal/        # in-memory log and journal strategies
-├── live/           # Gemini Live session and prompts
+├── journal/        # one journal write path and read-only snapshots
+├── observer/       # silent Gemini Live Observer
+├── responder/      # fixed-horizon and ReAct answers
+├── live/           # Observer cost estimation
+├── nonlive/        # shared request-context compaction helpers
+├── sessions/       # durable gameplay events, thumbnails, and index
 ├── ui/             # overlay, settings, hotkeys, and theme
-├── core/           # dormant general-purpose ReAct agent harness
-└── models/         # model plumbing used by the sidecar summarizer
+├── core/           # ReAct harness adapted by Chiron-Responder
+└── models/         # model catalogue, calls, pricing, and usage
 ```

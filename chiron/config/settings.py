@@ -18,12 +18,10 @@ defaults, so a settings file written by an older build still opens; a file that
 is outright unparseable is reported and replaced by defaults rather than being
 allowed to stop the app from starting.
 
-**The selected model decides the mode.** ``selected_model`` is provider-qualified
-— ``live/<id>`` for the Gemini Live API, ``gemini/<id>`` for Google AI Studio,
-``openrouter/<vendor>/<id>`` for OpenRouter — and picking one is the only way to
-choose between live and non-live operation. There is no separate mode toggle to
-contradict it. v0's ``live_model`` field is migrated on load, so an existing
-settings file keeps running the model it was already running.
+Chiron v3 always has two agents. ``observer_model`` names the required Gemini
+Live observer and ``responder_model`` names an ordinary Google AI Studio or
+OpenRouter completion model. Older selected-model settings are accepted by the
+pre-validator, but only the dual-agent shape is written back to disk.
 """
 
 from __future__ import annotations
@@ -45,13 +43,13 @@ logger = logging.getLogger(__name__)
 #: is the one selection id that never reaches litellm.
 LIVE_PREFIX = "live/"
 
-#: The Live API model the overlay talks to. Every Live model still served is a
-#: native-audio one — the text-out half-cascade models were retired — so Chiron
-#: takes the model's speech and renders its own transcription as text.
+#: The Live API model Chiron-Observer talks to. It is native-audio, but Observer
+#: audio and content are discarded; only journal tool calls cross the boundary.
 DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
-#: What a fresh install talks to: the Live API, as in v0.
-DEFAULT_MODEL = LIVE_PREFIX + DEFAULT_LIVE_MODEL
+#: Provider-qualified defaults for the two v3 agents.
+DEFAULT_OBSERVER_MODEL = LIVE_PREFIX + DEFAULT_LIVE_MODEL
+DEFAULT_RESPONDER_MODEL = "gemini/gemini-3.6-flash"
 
 #: Known Live API model ids, offered in the settings page combo box. The field is
 #: editable, so a newer id can always be typed in.
@@ -61,40 +59,15 @@ LIVE_MODEL_CHOICES: list[str] = [
     "gemini-2.5-flash-native-audio-preview-12-2025",
 ]
 
-#: Context window of the native-audio Live models, used for the "how far back can
-#: it see" estimate on the capture page.
-LIVE_CONTEXT_TOKENS = 128_000
-
-#: litellm id for the sidecar summariser — a regular (non-Live) chat model.
-DEFAULT_SIDECAR_MODEL = "gemini/gemini-3.6-flash"
-
-SIDECAR_MODEL_CHOICES: list[str] = [
-    "gemini/gemini-3.6-flash",
-    "gemini/gemini-2.5-flash",
-    "gemini/gemini-2.5-flash-lite",
-]
-
 #: Environment variables consulted, in order, when no key is saved.
 API_KEY_ENV_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 #: Environment variable consulted when no OpenRouter key is saved.
 OPENROUTER_API_KEY_ENV_VARS = ("OPENROUTER_API_KEY",)
 
-JournalStrategy = Literal["tool_call", "sidecar"]
 MediaResolution = Literal["low", "medium", "high"]
-AgentMode = Literal["unified", "split"]
-TriggerStrategy = Literal["spike_gated_heartbeat", "spike_plain_heartbeat"]
-
-#: "Frame detail" resolved to a capture width, for non-live providers.
-#:
-#: The setting means the same thing in both modes — how closely the model reads
-#: each frame, at what token cost — but the mechanism differs. The Live API takes
-#: the same pixels and spends a different server-side token budget on them
-#: (``media_resolution``); a request/response endpoint has no such knob, so the
-#: lever is the pixels themselves. 512 px is deliberate: a 16:9 frame at 512x288
-#: lands in Gemini's flat sub-384px tier at ~258 tokens, near enough the ~260
-#: tokens a live ``low`` frame costs that the tiers mean the same spend either way.
-DETAIL_CAPTURE_WIDTH: dict[str, int] = {"low": 512, "medium": 768, "high": 1152}
+ResponderMode = Literal["fixed_horizon", "react"]
+QuestionFramePolicy = Literal["latest", "immediate"]
 
 
 def is_live_selection(selection: str) -> bool:
@@ -115,49 +88,33 @@ def live_model_id(selection: str) -> str:
     return DEFAULT_LIVE_MODEL
 
 
-def litellm_model_id(selection: str) -> str:
-    """The litellm id for a non-live selection (already provider-qualified)."""
-    return (selection or "").strip()
-
-
 class CaptureSettings(BaseModel):
-    """Screen capture and the adaptive shutter.
+    """Fixed-interval screen capture shared by both agents.
 
     Attributes:
         monitor_index (int): ``mss`` monitor number. 0 is the virtual "all
             monitors" screen; 1 is the primary display.
-        baseline_interval_seconds (float): Seconds between keepalive frames when
-            nothing in particular is happening.
-        burst_interval_seconds (float): Seconds between frames while bursting.
-            1.0 is the API ceiling of 1 fps.
-        burst_duration_seconds (float): How long a burst lasts once triggered.
+        interval_seconds (float): Seconds between scheduled Observer frames.
+            Gemini Live accepts at most one video frame per second.
+        question_frame_policy (QuestionFramePolicy): Reuse the latest scheduled
+            frame, or capture exactly one new frame for a question.
         frame_width (int): Frames are downscaled to this width before encoding.
         jpeg_quality (int): JPEG quality (1-95) for encoded frames.
         stamp_timestamp (bool): Draw the capture time into the frame's corner so
             the model has an explicit "now" to reason about.
-        scene_change_enabled (bool): Trigger a burst when a cheap pixel diff sees
-            the screen change hard (loading screen, new area, death screen).
-        scene_change_threshold (float): Normalised 0-1 difference between two
-            frame signatures above which a scene change is declared.
-        media_resolution (MediaResolution): "Frame detail" — how closely the
-            model reads each frame. In live mode this is the API's token budget
-            per frame (``low`` is roughly 260 tokens); in non-live mode there is
-            no such server-side knob, so it resolves to a capture width through
-            :data:`DETAIL_CAPTURE_WIDTH` and supersedes ``frame_width``.
+        media_resolution (MediaResolution): Gemini Live's Observer-side visual
+            token budget. It is independent of ``frame_width`` in v3.
         watch_on_launch (bool): Begin watching the moment Chiron starts. Off by
             default: a screen recorder that switches itself on when you log in is
             not something anyone should have to opt out of.
     """
 
     monitor_index: int = 1
-    baseline_interval_seconds: float = Field(default=4.0, ge=0.5, le=60.0)
-    burst_interval_seconds: float = Field(default=1.0, ge=1.0, le=10.0)
-    burst_duration_seconds: float = Field(default=15.0, ge=1.0, le=120.0)
+    interval_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    question_frame_policy: QuestionFramePolicy = "latest"
     frame_width: int = Field(default=768, ge=256, le=1920)
     jpeg_quality: int = Field(default=60, ge=10, le=95)
     stamp_timestamp: bool = True
-    scene_change_enabled: bool = True
-    scene_change_threshold: float = Field(default=0.12, ge=0.01, le=1.0)
     media_resolution: MediaResolution = "low"
     watch_on_launch: bool = False
 
@@ -171,65 +128,9 @@ class CaptureSettings(BaseModel):
         Returns:
             float: Estimated tokens per minute of ambient capture.
         """
-        if self.baseline_interval_seconds <= 0:
+        if self.interval_seconds <= 0:
             return 0.0
-        return (60.0 / self.baseline_interval_seconds) * tokens_per_frame
-
-
-class JournalSettings(BaseModel):
-    """How meaning is moved out of the frames before they are evicted.
-
-    Attributes:
-        strategy (JournalStrategy): ``tool_call`` gives the live model a
-            ``record_event`` function to call; ``sidecar`` summarises the recent
-            transcript with a separate cheap model on a timer.
-        sidecar_model (str): litellm model id used by the sidecar summariser.
-        sidecar_interval_seconds (float): How often the sidecar runs.
-        sidecar_frame_count (int): How many recent frames the sidecar is shown.
-        fold_interval_seconds (float): How often the recent journal is folded
-            back into the live session as text.
-        fold_entry_limit (int): Maximum journal entries included in one fold.
-        max_entries (int): Entries kept in memory before the oldest are dropped.
-    """
-
-    strategy: JournalStrategy = "tool_call"
-    sidecar_model: str = DEFAULT_SIDECAR_MODEL
-    sidecar_interval_seconds: float = Field(default=180.0, ge=30.0, le=1800.0)
-    sidecar_frame_count: int = Field(default=3, ge=0, le=8)
-    fold_interval_seconds: float = Field(default=120.0, ge=30.0, le=900.0)
-    fold_entry_limit: int = Field(default=40, ge=1, le=200)
-    max_entries: int = Field(default=500, ge=10, le=5000)
-
-
-class ObserverSettings(BaseModel):
-    """When the non-live observer is worth paying for.
-
-    A live session gets ambient awareness free — frames stream in and simply
-    *are* in the model's context. A request/response endpoint gives nothing
-    away: every observation is a billed call. So the observer fires on evidence
-    (an ambient-weighted novelty spike) plus a heartbeat, with a cooldown that
-    caps the damage however noisy the triggers get.
-
-    Attributes:
-        trigger_strategy (TriggerStrategy): ``spike_gated_heartbeat`` skips the
-            periodic tick when nothing has drifted since the last run — best
-            cost profile. ``spike_plain_heartbeat`` always fires on the
-            interval, for a simpler liveness guarantee at a small idle cost.
-        heartbeat_interval_seconds (float): How often the periodic tick comes
-            round, whether or not it ends up firing.
-        cooldown_seconds (float): Minimum gap between observer calls. This is
-            the ceiling on observer spend: no sequence of triggers can beat it.
-        spike_sensitivity (float): How many deviations above its own rolling
-            mean a frame's novelty must reach to count as an event. Higher is
-            more conservative.
-        max_frames_per_call (int): Frames shown to the observer in one call.
-    """
-
-    trigger_strategy: TriggerStrategy = "spike_gated_heartbeat"
-    heartbeat_interval_seconds: float = Field(default=90.0, ge=15.0, le=900.0)
-    cooldown_seconds: float = Field(default=25.0, ge=5.0, le=600.0)
-    spike_sensitivity: float = Field(default=3.0, ge=1.0, le=10.0)
-    max_frames_per_call: int = Field(default=3, ge=1, le=8)
+        return (60.0 / self.interval_seconds) * tokens_per_frame
 
 
 class OverlaySettings(BaseModel):
@@ -303,58 +204,114 @@ class Settings(BaseModel):
             Studio. Empty means "look in the environment".
         openrouter_api_key (str): OpenRouter key. Empty means the environment,
             and no key at all means OpenRouter is simply absent from the picker.
-        selected_model (str): The provider-qualified model Chiron thinks with —
-            ``live/…``, ``gemini/…`` or ``openrouter/…``. Whether this names a
-            live model is what decides which session provider runs.
-        agent_mode (AgentMode): Non-live only. ``unified`` runs one model and
-            one conversation for both observing and answering; ``split`` gives
-            the observer its own (typically cheaper) model.
-        observer_model (str): Non-live litellm id for the split-mode observer.
-            Empty falls back to the selected model.
+        observer_model (str): Provider-qualified Gemini Live model used only by
+            Chiron-Observer.
+        responder_model (str): Non-live Google or OpenRouter model used only by
+            Chiron-Responder.
+        responder_mode (ResponderMode): Fixed-horizon or ReAct execution.
         game_name (str): Optional name of the game being played, folded into the
             system instruction so the model knows what it is looking at.
-        extra_system_prompt (str): Free-form additions to the system instruction.
+        observer_system_prompt (str): Optional additions to Observer behavior.
+        responder_system_prompt (str): Optional additions to Responder behavior.
         capture (CaptureSettings): Screen capture configuration.
-        journal (JournalSettings): Journal strategy and cadence. The strategy
-            applies to live mode only — in non-live mode the observer is the
-            journal writer, always.
-        observer (ObserverSettings): Non-live observer cadence and triggers.
         overlay (OverlaySettings): Overlay appearance.
         hotkeys (HotkeySettings): Global shortcuts.
     """
 
     api_key: str = ""
     openrouter_api_key: str = ""
-    selected_model: str = DEFAULT_MODEL
-    agent_mode: AgentMode = "unified"
-    observer_model: str = ""
+    observer_model: str = DEFAULT_OBSERVER_MODEL
+    responder_model: str = DEFAULT_RESPONDER_MODEL
+    responder_mode: ResponderMode = "fixed_horizon"
     game_name: str = ""
-    extra_system_prompt: str = ""
+    observer_system_prompt: str = ""
+    responder_system_prompt: str = ""
 
     capture: CaptureSettings = Field(default_factory=CaptureSettings)
-    journal: JournalSettings = Field(default_factory=JournalSettings)
-    observer: ObserverSettings = Field(default_factory=ObserverSettings)
     overlay: OverlaySettings = Field(default_factory=OverlaySettings)
     hotkeys: HotkeySettings = Field(default_factory=HotkeySettings)
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_live_model(cls, data: Any) -> Any:
-        """Read a v0 file's ``live_model`` as a ``live/…`` selection.
-
-        v0 had one model field and it was always a Live API id. Someone
-        upgrading has a settings file saying so, and the honest reading of it is
-        "keep talking to that model" — not "fall back to the new default".
-        """
-        if not isinstance(data, dict) or data.get("selected_model"):
+    def _migrate_dual_agents(cls, data: Any) -> Any:
+        """Accept v0-v2 settings and emit one unambiguous in-memory v3 shape."""
+        if not isinstance(data, dict):
             return data
-        legacy = str(data.get("live_model") or "").strip()
-        if legacy:
-            data = dict(data)
-            data["selected_model"] = (
-                legacy if is_live_selection(legacy) else LIVE_PREFIX + legacy
+        migrated = dict(data)
+
+        selected = str(migrated.get("selected_model") or "").strip()
+        legacy_live = str(migrated.get("live_model") or "").strip()
+        is_legacy = bool(selected or legacy_live)
+        if not selected and legacy_live:
+            selected = (
+                legacy_live
+                if is_live_selection(legacy_live)
+                else LIVE_PREFIX + legacy_live
             )
-        return data
+        if selected:
+            if is_live_selection(selected):
+                migrated["observer_model"] = selected
+                migrated.setdefault("responder_model", DEFAULT_RESPONDER_MODEL)
+            else:
+                migrated["observer_model"] = DEFAULT_OBSERVER_MODEL
+                migrated["responder_model"] = selected
+        else:
+            observer = str(migrated.get("observer_model") or "").strip()
+            responder = str(migrated.get("responder_model") or "").strip()
+            if observer and "/" not in observer:
+                observer = LIVE_PREFIX + observer
+            migrated["observer_model"] = observer or DEFAULT_OBSERVER_MODEL
+            migrated["responder_model"] = responder or DEFAULT_RESPONDER_MODEL
+
+        # v2 used ``observer_model`` for a split request/response observer. The
+        # presence of the old selected-model switch disambiguates that shape;
+        # the value was intentionally ignored above unless it was the selection.
+        if is_legacy and not is_live_selection(selected):
+            migrated["observer_model"] = DEFAULT_OBSERVER_MODEL
+
+        capture = migrated.get("capture")
+        if isinstance(capture, dict):
+            capture = dict(capture)
+            if "interval_seconds" not in capture:
+                baseline = capture.get("baseline_interval_seconds")
+                try:
+                    value = float(baseline)
+                except (TypeError, ValueError):
+                    value = 5.0
+                capture["interval_seconds"] = value if 1.0 <= value <= 60.0 else 5.0
+            for name in (
+                "baseline_interval_seconds",
+                "burst_interval_seconds",
+                "burst_duration_seconds",
+                "scene_change_enabled",
+                "scene_change_threshold",
+            ):
+                capture.pop(name, None)
+            migrated["capture"] = capture
+
+        migrated.pop("journal", None)
+        migrated.pop("agent_mode", None)
+        migrated.pop("observer", None)
+        migrated.pop("selected_model", None)
+        migrated.pop("live_model", None)
+
+        old_prompt = str(migrated.get("extra_system_prompt") or "")
+        if old_prompt:
+            migrated.setdefault("observer_system_prompt", old_prompt)
+            migrated.setdefault("responder_system_prompt", old_prompt)
+        return migrated
+
+    @model_validator(mode="after")
+    def _validate_agent_models(self) -> Settings:
+        """Keep the two provider roles structurally disjoint."""
+        if not is_live_selection(self.observer_model):
+            raise ValueError("observer_model must be a live/<gemini-model> id")
+        responder = self.responder_model.strip()
+        if not responder.startswith(("gemini/", "openrouter/")):
+            raise ValueError(
+                "responder_model must use the gemini/ or openrouter/ provider"
+            )
+        return self
 
     # ------------------------------------------------------------ credentials
 
@@ -402,42 +359,11 @@ class Settings(BaseModel):
             return self.resolved_openrouter_key()
         return self.resolved_api_key()
 
-    # ----------------------------------------------------------------- model
-
-    @property
-    def is_live(self) -> bool:
-        """Whether the selected model runs over the Live API."""
-        return is_live_selection(self.selected_model)
-
-    @property
-    def live_model(self) -> str:
-        """The Live API model id implied by the current selection."""
-        return live_model_id(self.selected_model)
-
-    def observer_model_id(self) -> str:
-        """The litellm id the observer runs on.
-
-        Split mode's whole point is a cheap observer and a smart answerer, but
-        an empty field must not mean "no observer" — it means "the same model as
-        everything else", which is exactly unified mode's behaviour.
-        """
-        if self.agent_mode == "split" and self.observer_model.strip():
-            return self.observer_model.strip()
-        return litellm_model_id(self.selected_model)
-
     # --------------------------------------------------------------- capture
 
     def effective_frame_width(self) -> int:
-        """The capture width in force, honouring the mode's meaning of detail.
-
-        In live mode the raw ``frame_width`` is the width, and frame detail is a
-        separate API-side budget. In non-live mode detail *is* the width — two
-        dials on the same pixels would only let them contradict each other — so
-        ``frame_width`` is superseded (and hidden in the UI).
-        """
-        if self.is_live:
-            return self.capture.frame_width
-        return DETAIL_CAPTURE_WIDTH.get(self.capture.media_resolution, 768)
+        """The one capture width delivered to both v3 agents."""
+        return self.capture.frame_width
 
     def effective_capture(self) -> CaptureSettings:
         """Capture settings as the capture thread should actually run them."""
@@ -451,45 +377,26 @@ class Settings(BaseModel):
         """An independent copy, for editing in the settings window."""
         return Settings.model_validate(self.model_dump())
 
-    def requires_session_restart(self, other: Settings) -> bool:
-        """Whether moving from `self` to `other` invalidates the session.
-
-        For a live session, model id, credential, system instruction and journal
-        strategy are baked into the websocket's setup message, so changing any
-        of them means rotating rather than reconfiguring. For a non-live one
-        there is no socket to rotate, but the same edits change what every
-        request is built from — and crossing the live/non-live boundary replaces
-        the provider outright.
-
-        Observer cadence numbers are deliberately absent: they are read per tick
-        and apply in place.
-
-        Args:
-            other (Settings): The settings about to be applied.
-
-        Returns:
-            bool: True when the session must be restarted for the change to take
-                effect.
-        """
+    def requires_observer_reconnect(self, other: Settings) -> bool:
+        """Whether Observer websocket configuration changed."""
         return (
-            self.selected_model != other.selected_model
+            self.observer_model != other.observer_model
             or self.resolved_api_key() != other.resolved_api_key()
-            or self.resolved_openrouter_key() != other.resolved_openrouter_key()
-            or self.agent_mode != other.agent_mode
-            or self.observer_model_id() != other.observer_model_id()
             or self.game_name != other.game_name
-            or self.extra_system_prompt != other.extra_system_prompt
-            or self.journal.strategy != other.journal.strategy
+            or self.observer_system_prompt != other.observer_system_prompt
             or self.capture.media_resolution != other.capture.media_resolution
         )
 
-    def requires_provider_swap(self, other: Settings) -> bool:
-        """Whether the change moves across the live/non-live boundary.
-
-        A restart reopens the same kind of session; this asks the sharper
-        question of whether the object itself has to be replaced.
-        """
-        return self.is_live != other.is_live
+    def requires_responder_rebuild(self, other: Settings) -> bool:
+        """Whether the Responder adapter must be rebuilt, preserving memory."""
+        return (
+            self.responder_model != other.responder_model
+            or self.responder_mode != other.responder_mode
+            or self.key_for_model(self.responder_model)
+            != other.key_for_model(other.responder_model)
+            or self.game_name != other.game_name
+            or self.responder_system_prompt != other.responder_system_prompt
+        )
 
 
 def default_settings_path() -> Path:
@@ -673,28 +580,21 @@ def remove_configuration(path: str | Path | None = None) -> RemovalPlan:
 __all__ = [
     "API_KEY_ENV_VARS",
     "DEFAULT_LIVE_MODEL",
-    "DEFAULT_MODEL",
-    "DEFAULT_SIDECAR_MODEL",
-    "DETAIL_CAPTURE_WIDTH",
-    "LIVE_CONTEXT_TOKENS",
+    "DEFAULT_OBSERVER_MODEL",
+    "DEFAULT_RESPONDER_MODEL",
     "LIVE_MODEL_CHOICES",
     "LIVE_PREFIX",
     "OPENROUTER_API_KEY_ENV_VARS",
-    "SIDECAR_MODEL_CHOICES",
-    "AgentMode",
     "CaptureSettings",
     "HotkeySettings",
-    "JournalSettings",
-    "JournalStrategy",
     "MediaResolution",
-    "ObserverSettings",
     "OverlaySettings",
+    "QuestionFramePolicy",
     "RemovalPlan",
+    "ResponderMode",
     "Settings",
-    "TriggerStrategy",
     "default_settings_path",
     "is_live_selection",
-    "litellm_model_id",
     "live_model_id",
     "load_settings",
     "plan_removal",

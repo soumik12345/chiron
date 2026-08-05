@@ -1,6 +1,6 @@
-"""Keeping a non-live conversation inside the model's window, on purpose.
+"""Keeping the Responder's active context inside its model window.
 
-Before this existed, non-live mode had guards but no accounting. The caps were
+The older non-live provider had guards but no accounting. Its caps were
 count-denominated proxies — forty messages, forty journal entries, images demoted
 to placeholders — and none of them knows what a token is. On a small-context
 model (and the picker deliberately accepts any pasted OpenRouter id) the
@@ -18,8 +18,7 @@ Three things fix it, in the order they matter:
    before any real conversation was counted. Stripping it as a turn enters
    history (the same demotion images already get) means most sessions on 128k
    models never compact at all, which is the correct outcome. That lives in
-   :mod:`chiron.nonlive.session`; this module is what happens when it is not
-   enough.
+   history. Chiron-Responder now stores that canonical form directly.
 2. **Proactive.** Price the assembled messages against the model's window before
    each call and summarise above :data:`COMPACTION_TRIGGER_RATIO`.
 3. **Reactive.** Catch the typed :class:`litellm.ContextWindowExceededError` —
@@ -58,8 +57,10 @@ KEEP_RECENT_MESSAGES = 8
 #: the current turn anyway; this exists so the current turn is not free.
 IMAGE_TOKEN_ALLOWANCE = 300
 
-#: Window assumed when nothing can say what the model's really is.
-DEFAULT_CONTEXT_WINDOW = 128_000
+#: Conservative window assumed when neither provider metadata nor litellm knows
+#: a pasted model id. Overestimating can make a request fail; underestimating only
+#: compacts derived context earlier while the canonical records remain lossless.
+DEFAULT_CONTEXT_WINDOW = 32_000
 
 #: Marks the message that stands in for compacted history, and is what lets a
 #: second compaction *update* the first summary rather than summarising it again.
@@ -118,6 +119,15 @@ class CompactionOutcome:
     kept_tail_count: int
     dropped_count: int
     reason: str = "threshold"
+
+
+@dataclass(frozen=True)
+class ContextWindowInfo:
+    """Resolved context capacity with enough provenance to expose uncertainty."""
+
+    tokens: int
+    source: str
+    assumed: bool = False
 
 
 # ------------------------------------------------------------------ measuring
@@ -184,8 +194,8 @@ def count_tokens(model_id: str, messages: list[dict[str, Any]]) -> int:
         return characters // 4 + 4 * len(projected) + images
 
 
-def context_window_for(model_id: str) -> int:
-    """The model's input window in tokens, best-effort.
+def resolve_context_window(model_id: str) -> ContextWindowInfo:
+    """Resolve the model's input window without network traffic on the hot path.
 
     The catalogue is asked first, and only its **disk cache** — the settings page
     already fetched it, and a token count computed before every question is not
@@ -194,11 +204,11 @@ def context_window_for(model_id: str) -> int:
     carries no entries for ``openrouter/``-prefixed ids, and those are precisely
     the ones a user pastes in.
     """
-    from chiron.models.catalogue import cached_context_length
+    from chiron.models.catalogue import cached_context_length_info
 
-    cached = cached_context_length(model_id)
+    cached = cached_context_length_info(model_id)
     if cached:
-        return cached
+        return ContextWindowInfo(tokens=cached[0], source=cached[1])
 
     try:
         import litellm
@@ -210,10 +220,19 @@ def context_window_for(model_id: str) -> int:
                 continue
             window = info.get("max_input_tokens") or info.get("max_tokens")
             if window:
-                return int(window)
+                return ContextWindowInfo(tokens=int(window), source="LiteLLM metadata")
     except Exception:  # noqa: BLE001 - pragma: no cover
         logger.debug("Could not resolve a context window for %s", model_id)
-    return DEFAULT_CONTEXT_WINDOW
+    return ContextWindowInfo(
+        tokens=DEFAULT_CONTEXT_WINDOW,
+        source="conservative fallback",
+        assumed=True,
+    )
+
+
+def context_window_for(model_id: str) -> int:
+    """The resolved context length alone, for existing accounting callers."""
+    return resolve_context_window(model_id).tokens
 
 
 def _id_candidates(model_id: str) -> list[str]:
@@ -400,12 +419,14 @@ __all__ = [
     "KEEP_RECENT_MESSAGES",
     "SUMMARY_SYSTEM_PROMPT",
     "CompactionOutcome",
+    "ContextWindowInfo",
     "build_summary_request",
     "context_window_for",
     "count_images",
     "count_tokens",
     "extract_previous_summary",
     "is_context_overflow",
+    "resolve_context_window",
     "serialise_history",
     "should_compact",
     "split_history",

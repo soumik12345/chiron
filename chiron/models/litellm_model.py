@@ -162,7 +162,7 @@ class LiteLLMModel(BaseModel):
     """
 
     model_id: str
-    temperature: float = 0.7
+    temperature: float | None = 0.7
     max_tokens: int | None = None
     api_base: str | None = None
     api_key: str | None = Field(default=None, repr=False, exclude=True)
@@ -193,6 +193,7 @@ class LiteLLMModel(BaseModel):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> Any:
         """Issue a (possibly streaming) chat completion via litellm.
 
@@ -206,6 +207,8 @@ class LiteLLMModel(BaseModel):
             tools (list[dict[str, Any]] | None): Tool schemas in OpenAI function-calling
                 format. Defaults to None.
             stream (bool): Whether to request a streaming response. Defaults to False.
+            tool_choice (str | dict | None): Provider tool-selection policy. When
+                omitted, tool-enabled calls use ``auto``.
 
         Returns:
             Any: A litellm `ModelResponse` (non-streaming) or async generator
@@ -219,13 +222,14 @@ class LiteLLMModel(BaseModel):
         kwargs: dict[str, Any] = {
             "model": self.model_id,
             "messages": messages,
-            "temperature": self.temperature,
             "timeout": self.timeout,
             "stream": stream,
         }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         if tools:
             kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+            kwargs["tool_choice"] = tool_choice or "auto"
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         if self.api_base:

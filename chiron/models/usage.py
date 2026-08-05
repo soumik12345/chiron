@@ -50,6 +50,12 @@ LLMCallKind = Literal[
     "nonlive_observer",
     "journal_sidecar",
     "live_turn",
+    "fixed_answer",
+    "react_step",
+    "responder_compaction",
+    "journal_compaction",
+    "observer_checkpoint",
+    "observer_context",
 ]
 
 #: `ok` billed normally. `retry` is an attempt that failed transiently and *was*
@@ -67,8 +73,8 @@ LLMCallStatus = Literal["ok", "retry", "error"]
 #: nothing could price it.
 #:
 #: `estimated` is the odd one out and deliberately distinct: the Live API never
-#: reports usage in a shape chiron can bill from, so live-mode rows are arithmetic
-#: — frames times a per-frame token figure, plus transcript length — rather than
+#: reports usage in a shape chiron can bill from, so Observer rows are arithmetic
+#: — frames, checkpoint/context text, and discarded audio duration — rather than
 #: measurement. Every surface that renders a total checks for this and prefixes a
 #: `~`, because a number derived from a token estimate and a number a provider
 #: charged should never look alike.

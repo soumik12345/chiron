@@ -3,10 +3,9 @@
 One object, owned by :class:`~chiron.app.ChironApp` and subscribed in its
 ``_connect()`` to signals that already existed. That relationship is the whole
 design constraint: **the recorder observes, it never participates.** It cannot
-refuse a frame, delay an answer, or raise into gameplay — every public method
-swallows its own failures — and it outlives the session provider across a
-live/non-live swap exactly as the journal does, because a gameplay session spans
-whatever the player does with the model picker mid-evening.
+refuse a frame, delay an answer, or raise into gameplay—every public method
+swallows its own failures—and it outlives Observer reconnects and Responder
+rebuilds because a gameplay session spans both agents.
 
 Two consequences worth stating:
 
@@ -50,7 +49,7 @@ from chiron.sessions.store import (
 logger = logging.getLogger(__name__)
 
 #: How often buffered events reach the disk. Short enough that a crash costs
-#: seconds, long enough that a 1 fps burst is one write rather than fifteen.
+#: seconds, long enough that several agent events share one write.
 FLUSH_INTERVAL_MS = 2000
 
 #: How often ``index.json`` is rewritten while a session is recording. Slower
@@ -58,8 +57,8 @@ FLUSH_INTERVAL_MS = 2000
 #: matters to a browser the player is not looking at mid-fight.
 INDEX_INTERVAL_MS = 15_000
 
-#: Frames remembered, so a frame sent twice — a question frame the observer then
-#: looks at too — reuses its thumbnail rather than writing a second copy. The
+#: Frames remembered, so one image delivered to both agents reuses its thumbnail
+#: rather than writing a second copy. The
 #: ring buffer upstream is smaller than this, so in practice every repeat is
 #: caught.
 _FRAME_MEMORY = 64
@@ -158,7 +157,7 @@ class SessionRecorder(QObject):
         """What the open session has spent so far."""
         return self._rollup
 
-    def ensure_session(self, *, game: str = "", mode: str = "live") -> str:
+    def ensure_session(self, *, game: str = "", mode: str = "dual_agent") -> str:
         """Open a session if none is open, and return its id.
 
         Called from the two moments that count as the player actually starting
@@ -167,7 +166,7 @@ class SessionRecorder(QObject):
 
         Args:
             game (str): The detected or configured game, for the auto-title.
-            mode (str): ``live`` or ``nonlive`` at creation.
+            mode (str): Runtime topology at creation; v3 uses ``dual_agent``.
 
         Returns:
             str: The open session's id, which may be one that already existed.
@@ -302,21 +301,26 @@ class SessionRecorder(QObject):
         *,
         frames: list[str] | None = None,
         call_id: str | None = None,
+        agent_id: str | None = None,
     ) -> None:
         """Record one conversation turn.
 
-        Frames attached to a question are recorded as their own ``frame`` events
-        at the moment they were sent rather than being folded in here: the
-        message is written when the player asked, and which frames the provider
-        chose is decided a beat later, once the burst it triggered has landed.
-        The viewer interleaves by timestamp, so they still render together.
+        Frames attached to a question are separate, agent-attributed ``frame``
+        events. The viewer interleaves them by timestamp.
         """
         if self._store is None or not (text or "").strip():
             return
         if self._row is not None:
             self._row.message_count += 1
         self._append(
-            "message", ev.message(role=role, text=text, frames=frames, call_id=call_id)
+            "message",
+            ev.message(
+                role=role,
+                text=text,
+                frames=frames,
+                call_id=call_id,
+                agent_id=agent_id,
+            ),
         )
 
     def record_journal_entry(self, entry: JournalEntry) -> None:
@@ -336,12 +340,14 @@ class SessionRecorder(QObject):
             ts=entry.timestamp,
         )
 
-    def record_frame(self, frame: Frame, reason: str) -> str:
+    def record_frame(
+        self, frame: Frame, reason: str, *, agent_id: str | None = None
+    ) -> str:
         """Store a thumbnail of a frame that reached a model, and note it.
 
         Args:
             frame (Frame): The frame that was sent.
-            reason (str): ``question``, ``observer`` or ``burst``.
+            reason (str): ``question``, ``scheduled`` or ``immediate``.
 
         Returns:
             str: The frame id, or empty when nothing was stored — either no
@@ -351,6 +357,13 @@ class SessionRecorder(QObject):
             return ""
         known = self._frame_ids.get(_frame_key(frame))
         if known:
+            self._append_frame_event(
+                frame,
+                known,
+                reason,
+                f"{known}.jpg",
+                agent_id=agent_id,
+            )
             return known
         now = time.time()
         if (
@@ -367,6 +380,19 @@ class SessionRecorder(QObject):
             return ""
         self._last_thumbnail_at = now
         self._remember_frame(frame, frame_id)
+        self._append_frame_event(frame, frame_id, reason, path.name, agent_id=agent_id)
+        return frame_id
+
+    def _append_frame_event(
+        self,
+        frame: Frame,
+        frame_id: str,
+        reason: str,
+        thumbnail: str,
+        *,
+        agent_id: str | None,
+    ) -> None:
+        """Attribute one delivery while allowing its thumbnail to be reused."""
         if self._row is not None:
             self._row.frame_count += 1
             self._row.has_thumbnails = True
@@ -378,42 +404,10 @@ class SessionRecorder(QObject):
                 width=frame.width,
                 height=frame.height,
                 reason=reason,
-                thumbnail=path.name,
+                thumbnail=thumbnail,
+                agent_id=agent_id,
             ),
             ts=frame.captured_at,
-        )
-        return frame_id
-
-    def record_observer_run(self, payload: dict[str, Any]) -> None:
-        """Record one observer tick — the agent trace of non-live mode.
-
-        Frames in the payload arrive as :class:`~chiron.capture.frames.Frame`
-        objects; they are turned into ids here, which also stores any thumbnail
-        that has not been stored yet.
-        """
-        if self._store is None:
-            return
-        frames = [
-            fid
-            for fid in (
-                self.record_frame(f, "observer")
-                for f in payload.get("frames") or []
-                if isinstance(f, Frame)
-            )
-            if fid
-        ]
-        skipped = bool(payload.get("skipped"))
-        if self._row is not None and not skipped:
-            self._row.observer_runs += 1
-        self._append(
-            "observer_run",
-            ev.observer_run(
-                reason=str(payload.get("reason") or ""),
-                frames=frames,
-                entries=int(payload.get("entries") or 0),
-                call_id=payload.get("call_id"),
-                skipped=skipped,
-            ),
         )
 
     def record_llm_call(self, record: Any) -> None:
@@ -428,9 +422,8 @@ class SessionRecorder(QObject):
         payload = (
             record.model_dump() if hasattr(record, "model_dump") else dict(record or {})
         )
-        # Whoever installed the sink may not have known which session was open
-        # when the call was made — the sidecar's model is built once and outlives
-        # several — so the recorder, which does know, fills it in.
+        # Whoever installed the sink may not have known which gameplay session
+        # was open, so the recorder—which does know—fills it in.
         payload.setdefault("session_id", None)
         if not payload["session_id"]:
             payload["session_id"] = self._store.session_id
@@ -457,14 +450,32 @@ class SessionRecorder(QObject):
                 dropped_count=int(payload.get("dropped_count") or 0),
                 reason=str(payload.get("reason") or ""),
                 call_id=payload.get("call_id"),
+                agent_id=payload.get("agent_id"),
             ),
         )
 
-    def record_status(self, status: str, detail: str = "") -> None:
+    def record_status(
+        self, status: str, detail: str = "", *, agent_id: str | None = None
+    ) -> None:
         """Record a provider status transition."""
         if self._store is None:
             return
-        self._append("status", ev.status(status=status, detail=detail))
+        self._append(
+            "status",
+            ev.status(status=status, detail=detail, agent_id=agent_id),
+        )
+
+    def record_agent_trace(self, payload: dict[str, Any]) -> None:
+        """Record diagnostic ReAct events without adding transcript turns."""
+        if self._store is None:
+            return
+        self._append(
+            "agent_trace",
+            ev.agent_trace(
+                agent_id=str(payload.get("agent_id") or "responder"),
+                event=payload.get("event"),
+            ),
+        )
 
     def record_settings_changed(self, fields: list[str], mode: str) -> None:
         """Record which settings changed mid-session, and the mode afterwards."""

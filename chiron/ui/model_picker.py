@@ -1,9 +1,8 @@
-"""One dropdown listing every model Chiron can reach, across every provider.
+"""A searchable model card used by both agent-specific pickers.
 
-Mode selection *is* model selection — there is no separate live/non-live toggle
-to contradict the choice — so this is the single most consequential control in
-the settings page, and it has three jobs that pull against each other. It has to
-show enough to choose with (which provider, which mode, what it costs), it has
+The settings page filters the same control into a Live-only Observer list and a
+non-live Responder list. Each instance has three jobs that pull against each
+other. It has to show enough to choose with (provider, capabilities, and cost), it has
 to stay usable at several hundred entries, and it has to accept an id it has
 never heard of, because a catalogue fetched over the network cannot be the only
 way to name a model released this morning or held in a settings file from last

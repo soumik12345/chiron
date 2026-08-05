@@ -253,51 +253,55 @@ def test_closing_while_watching_closes_the_span(recorder):
     assert recorder.sessions()[0].watched_seconds > 0
 
 
-def test_a_frame_is_thumbnailed_once_however_often_it_is_sent(recorder):
-    recorder.ensure_session(mode="nonlive")
+def test_a_frame_thumbnail_is_reused_but_each_agent_delivery_is_attributed(recorder):
+    recorder.ensure_session(mode="dual_agent")
     frame = _frame()
 
-    first = recorder.record_frame(frame, "question")
-    second = recorder.record_frame(frame, "observer")
+    first = recorder.record_frame(frame, "question", agent_id="responder")
+    second = recorder.record_frame(frame, "scheduled", agent_id="observer")
 
     assert first == second == "000001"
-    assert recorder.sessions()[0].frame_count == 1
+    assert recorder.sessions()[0].frame_count == 2
+    assert (
+        len(list(recorder.store_for(recorder.session_id).frames_directory.iterdir()))
+        == 1
+    )
+    recorder.flush()
+    events = [
+        event
+        for event in recorder.read_session(recorder.session_id)
+        if event.type == "frame"
+    ]
+    assert [event.payload["agent_id"] for event in events] == [
+        "responder",
+        "observer",
+    ]
 
 
 def test_the_thumbnail_rate_cap_is_the_escape_hatch(qapp, tmp_path):
-    """Off by default in v2; on, it drops the extras in a burst."""
+    """Off by default; on, it drops closely spaced extra thumbnails."""
     recorder = SessionRecorder(tmp_path / "sessions", thumbnail_min_interval=60.0)
-    recorder.ensure_session(mode="live")
+    recorder.ensure_session(mode="dual_agent")
 
-    kept = [recorder.record_frame(_frame(), "burst") for _ in range(5)]
+    kept = [recorder.record_frame(_frame(), "scheduled") for _ in range(5)]
 
     assert kept[0] == "000001"
     assert kept[1:] == ["", "", "", ""]
 
 
-def test_an_observer_run_names_the_frames_it_looked_at(recorder):
-    recorder.ensure_session(mode="nonlive")
-    frames = [_frame(), _frame()]
-
-    recorder.record_observer_run(
-        {"reason": "scene change", "frames": frames, "entries": 2}
+def test_an_old_observer_run_still_rescans_and_renders(tmp_path):
+    store = SessionStore.create(tmp_path, "old-v2")
+    store.append(
+        [
+            ev.SessionEvent(
+                ts=1.0,
+                type="observer_run",
+                payload={"reason": "heartbeat", "frames": [], "entries": 1},
+            )
+        ]
     )
-    recorder.flush()
-
-    run = next(
-        e
-        for e in recorder.read_session(recorder.session_id)
-        if e.type == "observer_run"
-    )
-    assert run.payload["frames"] == ["000001", "000002"]
-    assert run.payload["entries"] == 2
-
-
-def test_a_skipped_observer_tick_is_recorded_but_not_counted(recorder):
-    recorder.ensure_session(mode="nonlive")
-    recorder.record_observer_run({"reason": "heartbeat", "frames": [], "skipped": True})
-
-    assert recorder.sessions()[0].observer_runs == 0
+    assert summarise(store).observer_runs == 1
+    assert "looked (heartbeat)" in render_events(store.read_events())
 
 
 def test_costs_roll_up_by_model_and_by_kind(recorder):
@@ -413,7 +417,7 @@ def test_every_recorded_type_is_in_the_vocabulary(recorder):
     recorder.record_message("user", "hi")
     recorder.record_frame(_frame(), "question")
     recorder.record_journal_entry(JournalEntry(timestamp=time.time(), note="n"))
-    recorder.record_observer_run({"reason": "heartbeat", "frames": [], "entries": 0})
+    recorder.record_agent_trace({"agent_id": "responder", "event": {"type": "turn"}})
     recorder.record_llm_call(LLMCallRecord(model_id="m"))
     recorder.record_compaction({"mode": "nonlive"})
     recorder.record_status("live", "gemini/flash")
@@ -430,7 +434,7 @@ def test_two_different_frames_are_two_thumbnails(recorder):
     """A value key, not an address: a freed frame's address gets reused."""
     recorder.ensure_session(mode="live")
 
-    ids = [recorder.record_frame(_frame(), "burst") for _ in range(4)]
+    ids = [recorder.record_frame(_frame(), "scheduled") for _ in range(4)]
 
     assert ids == ["000001", "000002", "000003", "000004"]
 
@@ -443,7 +447,7 @@ def test_the_recorders_counters_match_a_rescan(recorder, tmp_path):
     recorder.record_message("assistant", "hello")
     recorder.record_frame(_frame(), "question")
     recorder.record_journal_entry(JournalEntry(timestamp=time.time(), note="n"))
-    recorder.record_observer_run({"reason": "spike", "frames": [], "entries": 1})
+    recorder.record_agent_trace({"agent_id": "responder", "event": {"type": "turn"}})
     recorder.record_compaction({"mode": "nonlive"})
     recorder.record_llm_call(
         LLMCallRecord(model_id="m", cost_usd=0.02, total_tokens=10)

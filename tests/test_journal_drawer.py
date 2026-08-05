@@ -215,7 +215,7 @@ def test_reopening_restores_both_the_size_and_the_drawer(overlay):
 def test_a_journal_entry_reaches_the_drawer_and_the_record(app):
     app.set_watching(True)
 
-    app._on_journal_entry(JournalEntry(timestamp=time.time(), note="Lit the bonfire."))
+    app.journal_service.record("Lit the bonfire.", timestamp=time.time())
     app.recorder.flush()
 
     assert "Lit the bonfire." in app.overlay.journal_drawer.body.toPlainText()
@@ -227,7 +227,7 @@ def test_a_journal_entry_reaches_the_drawer_and_the_record(app):
 
 def test_a_new_session_forgets_the_drawer_too(app):
     app.set_watching(True)
-    app._on_journal_entry(JournalEntry(timestamp=time.time(), note="Lit the bonfire."))
+    app.journal_service.record("Lit the bonfire.", timestamp=time.time())
 
     app.new_session()
 

@@ -372,7 +372,7 @@ def _is_empty_reply(message: dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------- #
 # Message helpers + normalised LLM result
 # --------------------------------------------------------------------------- #
-def _user_message(content: str) -> dict[str, Any]:
+def _user_message(content: Any) -> dict[str, Any]:
     """Build a user message."""
     return {"role": "user", "content": content}
 
@@ -479,7 +479,7 @@ class ReactAgent:
         model_id: str = "openrouter/openai/gpt-4o-mini",
         system_prompt: str = SYSTEM_PROMPT,
         instructions: str | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = 0.7,
         max_tokens: int | None = None,
         max_iterations: int | None = 25,
         yolo_mode: bool = True,
@@ -498,6 +498,8 @@ class ReactAgent:
         completion_guard: CompletionGuard | None = None,
         max_completion_nudges: int = 2,
         max_empty_replies: int = 2,
+        first_tool_choice: str | dict[str, Any] | None = None,
+        usage_kind: str = "turn",
     ) -> None:
         """Initialise the agent with its tool set and configuration.
 
@@ -579,6 +581,8 @@ class ReactAgent:
         self.completion_guard = completion_guard
         self.max_completion_nudges = max_completion_nudges
         self.max_empty_replies = max_empty_replies
+        self.first_tool_choice = first_tool_choice
+        self.usage_kind = usage_kind
         self.queue_mode: QueueMode = queue_mode
         self.session = session
         self.auto_compact = auto_compact
@@ -721,7 +725,7 @@ class ReactAgent:
     # ----------------------------------------------------------------------- #
     def stream_events(
         self,
-        prompt: str | None = None,
+        prompt: str | list[dict[str, Any]] | None = None,
         *,
         auto_approve: bool | None = None,
         provider_stream: bool = False,
@@ -757,7 +761,7 @@ class ReactAgent:
 
     async def run(
         self,
-        prompt: str | None = None,
+        prompt: str | list[dict[str, Any]] | None = None,
         *,
         stream: bool = False,
         auto_approve: bool | None = None,
@@ -1451,6 +1455,7 @@ class ReactAgent:
                     messages=self._provider_messages(),
                     tools=self._tool_specs(),
                     stream=provider_stream,
+                    tool_choice=self.first_tool_choice if turn == 1 else None,
                 )
                 if not provider_stream:
                     result, raw_usage = self._parse_response(response)
@@ -1479,6 +1484,7 @@ class ReactAgent:
                     self.model.record_failure(
                         e,
                         context={
+                            "kind": self.usage_kind,
                             "turn": turn,
                             "attempt": attempts,
                             "started_at": started_at,
@@ -1493,6 +1499,7 @@ class ReactAgent:
                 self.model.record_failure(
                     e,
                     context={
+                        "kind": self.usage_kind,
                         "status": "error" if terminal else "retry",
                         "turn": turn,
                         "attempt": attempts,
@@ -1523,7 +1530,7 @@ class ReactAgent:
             raw_usage,
             response=response,
             context={
-                "kind": "turn",
+                "kind": self.usage_kind,
                 "turn": turn,
                 "attempt": attempts,
                 "started_at": started_at,

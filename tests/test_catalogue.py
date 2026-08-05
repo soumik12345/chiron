@@ -129,10 +129,10 @@ def test_an_unknown_id_is_describable_without_being_known():
 # ------------------------------------------------------------- combined view
 
 
-def test_a_provider_with_no_key_is_absent(monkeypatch):
+def test_a_provider_with_no_key_is_absent():
     """Activation is by key. Offering models nothing can call would be a lie."""
     models = available_models(google_key="", openrouter_key="")
-    assert models == STATIC_MODELS
+    assert models == [model for model in STATIC_MODELS if model.provider != OPENROUTER]
 
 
 def test_no_key_means_no_google_models():

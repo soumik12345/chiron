@@ -1,134 +1,83 @@
-"""The seam between "how Chiron thinks" and everything else it does.
+"""Narrow contracts for Chiron's two permanent runtime agents.
 
-:class:`~chiron.app.ChironApp` already talked to the Live session through a
-narrow surface — start, stop, send a question, send a frame, fold the journal,
-apply settings, plus five signals. v1 turns that surface into an interface with
-two implementations behind it:
-
-* :class:`~chiron.live.session.LiveSessionManager` — a persistent websocket that
-  frames stream into, unchanged from v0.
-* :class:`~chiron.nonlive.session.NonLiveSessionManager` — a request/response
-  endpoint called on demand, with an observer keeping the journal.
-
-**The selected model decides which one runs**, and nothing else does. There is no
-mode toggle to contradict the model choice, so the two cannot disagree; picking a
-``live/…`` model runs live, picking anything else runs non-live. Crossing that
-boundary tears one provider down and builds the other, which is a longer version
-of the session restart the settings page already knew how to do.
-
-The status vocabulary is shared deliberately (``idle``, ``connecting``, ``live``,
-``reconnecting``, ``error``, ``stopped``). In non-live mode ``live`` means
-*armed* rather than *connected* — there is no socket being held open — but the
-overlay needs no changes and no branch, which is the whole return on defining the
-seam rather than teaching the app about two kinds of session.
-
-:class:`SessionProvider` is a :class:`typing.Protocol`, not a base class. Both
-implementations are ``QObject`` subclasses with Qt signals, and Qt's metaclass
-does not take kindly to sharing a hierarchy with an ABC; a structural type also
-states the honest requirement, which is that the app depends on the surface and
-not on the lineage.
+The Observer and Responder deliberately do not share a provider interface. The
+Observer owns the Gemini Live socket and can only write journal observations;
+the Responder owns user-visible answers and can only read a journal snapshot.
+``ChironApp`` constructs both, so changing a Responder model can never turn off
+or replace visual observation.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
-
-from PySide6.QtCore import QObject
 
 from chiron.capture.frames import Frame
 from chiron.config.settings import Settings
-from chiron.journal.log import JournalLog
-from chiron.journal.writers import JournalWriter
+
+
+@dataclass(frozen=True)
+class ObserverStatus:
+    """Responder-facing snapshot of visual freshness."""
+
+    state: str
+    watch_requested: bool
+    last_observed_at: float | None = None
+    detail: str = ""
+
+    @property
+    def stale(self) -> bool:
+        """Whether a question cannot be grounded in a current live span."""
+        return not (
+            self.watch_requested
+            and self.state == "live"
+            and self.last_observed_at is not None
+        )
 
 
 @runtime_checkable
-class SessionProvider(Protocol):
-    """What :class:`~chiron.app.ChironApp` requires of a session.
-
-    Both implementations emit the same nine signals. Five are the conversation
-    (``statusChanged``, ``responseStarted``, ``responseDelta``,
-    ``responseCompleted``, ``errorOccurred``) and are what the overlay renders.
-    Four are the record (``frameSent``, ``observerRan``, ``llmCall``,
-    ``compacted``) and are what :class:`~chiron.sessions.recorder.SessionRecorder`
-    writes down. A provider with nothing to say on one of them simply never
-    emits it — live mode has no observer, non-live mode has no journal fold —
-    which keeps the seam one shape rather than two.
-
-    Attributes:
-        status (str): Current status, from the shared vocabulary.
-        detected_game (str): The focused window, phrased for the instruction.
-            Runtime state, deliberately not a setting.
-        session_id (str): The gameplay session calls are billed to. Runtime
-            state, for the same reason, and carried across a provider swap by
-            hand exactly as ``detected_game`` is.
-        frames_sent (int): Frames handed to the model so far.
-    """
+class ObserverAgent(Protocol):
+    """Tool-only Live observer surface used by the application."""
 
     status: str
+    status_detail: str
     detected_game: str
     session_id: str
+    last_observed_at: float | None
 
     @property
-    def frames_sent(self) -> int:
-        """Frames handed to the model so far."""
+    def frames_sent(self) -> int: ...
 
-    def start(self) -> None:
-        """Begin a session, or arm the provider where there is nothing to open."""
+    def start(self) -> None: ...
 
-    async def stop(self, timeout: float = ...) -> None:
-        """End the session and stop any background work."""
+    async def stop(self, timeout: float = ...) -> None: ...
 
-    def send_text(self, text: str) -> None:
-        """Send a player question."""
+    def observe(self, frame: Frame, reason: str = ...) -> None: ...
 
-    def send_frame(self, frame: Frame) -> None:
-        """Offer a captured frame."""
+    def reset_memory(self) -> None: ...
 
-    def fold_journal(self, *, force: bool = ...) -> int:
-        """Push new journal entries into the session, where that means anything."""
-
-    def reset_observation(self) -> None:
-        """Forget what the screen looked like before now."""
-
-    def reset_memory(self) -> None:
-        """Forget the conversation entirely — a new gameplay session started.
-
-        Stronger than :meth:`reset_observation`, which only forgets what the
-        screen looked like. This is the model's own memory: the non-live
-        history, or the live session's server-side context, which can only be
-        cleared by reconnecting without the handle that would restore it.
-        """
-
-    def apply_settings(self, settings: Settings) -> None:
-        """Adopt new settings for subsequent requests."""
+    def apply_settings(self, settings: Settings) -> None: ...
 
 
-def build_session_provider(
-    settings: Settings,
-    journal: JournalLog,
-    writer: JournalWriter,
-    parent: QObject | None = None,
-) -> SessionProvider:
-    """Build the provider the selected model implies.
+@runtime_checkable
+class ResponderAgent(Protocol):
+    """Question-answering surface; only this contract emits transcript output."""
 
-    Args:
-        settings (Settings): Current configuration; its ``selected_model`` is
-            what decides.
-        journal (JournalLog): The shared journal.
-        writer (JournalWriter): The journal strategy in force.
-        parent (QObject | None): Qt parent for the manager.
+    session_id: str
+    detected_game: str
 
-    Returns:
-        SessionProvider: A live or non-live session manager.
-    """
-    if settings.is_live:
-        from chiron.live.session import LiveSessionManager
+    def ask(
+        self,
+        text: str,
+        frame: Frame | None,
+        observer_status: ObserverStatus,
+    ) -> None: ...
 
-        return LiveSessionManager(settings, journal, writer, parent)
+    def reset_memory(self) -> None: ...
 
-    from chiron.nonlive.session import NonLiveSessionManager
+    def apply_settings(self, settings: Settings) -> None: ...
 
-    return NonLiveSessionManager(settings, journal, writer, parent)
+    async def stop(self, timeout: float = ...) -> None: ...
 
 
-__all__ = ["SessionProvider", "build_session_provider"]
+__all__ = ["ObserverAgent", "ObserverStatus", "ResponderAgent"]
