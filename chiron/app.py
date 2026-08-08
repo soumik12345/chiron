@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +32,7 @@ from chiron.config.settings import (
 from chiron.journal.compaction import JournalCompactor
 from chiron.journal.log import JournalEntry, JournalLog
 from chiron.journal.service import JournalService
-from chiron.observer.session import ObserverSessionManager
+from chiron.observer.factory import build_observer
 from chiron.responder.conversation import ResponderConversation
 from chiron.responder.session import ResponderSessionManager
 from chiron.session import ObserverStatus
@@ -72,6 +73,7 @@ class ChironApp(QObject):
         self._questions: deque[_PendingQuestion] = deque()
         self._waiting_immediate: tuple[int, _PendingQuestion] | None = None
         self._question_token = 0
+        self._observer_drain_action: str | None = None
 
         self.recorder = SessionRecorder(sessions_root, self)
         self.journal = JournalLog()
@@ -80,11 +82,8 @@ class ChironApp(QObject):
             settings, self.journal_service, parent=self
         )
         self.conversation = ResponderConversation()
-        self.observer = ObserverSessionManager(
-            settings,
-            self.journal_service,
-            self.journal_compactor,
-            parent=self,
+        self.observer = build_observer(
+            settings, self.journal_service, self.journal_compactor, parent=self
         )
         self.responder = ResponderSessionManager(
             settings,
@@ -118,6 +117,8 @@ class ChironApp(QObject):
         self.overlay.sessionRenamed.connect(self._on_session_renamed)
         self.overlay.sessionDeleted.connect(self._on_session_deleted)
         self.overlay.sessionThumbnailsDeleted.connect(self._on_thumbnails_deleted)
+        self.overlay.observerRetryRequested.connect(self.retry_observer_batch)
+        self.overlay.observerDiscardRequested.connect(self.discard_observer_batch)
 
         self.recorder.sessionChanged.connect(self.overlay.set_session)
         self.recorder.sessionChanged.connect(self._on_session_changed)
@@ -157,6 +158,8 @@ class ChironApp(QObject):
         )
         self.observer.llmCall.connect(self.recorder.record_llm_call)
         self.observer.compacted.connect(self._on_compacted)
+        if hasattr(self.observer, "observerRan"):
+            self.observer.observerRan.connect(self.recorder.record_observer_run)
 
     def _connect_responder(self) -> None:
         self.responder.responseStarted.connect(self.overlay.start_response)
@@ -191,9 +194,9 @@ class ChironApp(QObject):
         self.window_tracker.start()
         self.capture.start()
         self.footer_timer.start()
-        if not self.settings.resolved_api_key():
+        if not self.settings.key_for_model(self.settings.observer_model):
             self.overlay.append_system(
-                "Google AI Studio key required: the Observer cannot watch without it."
+                "No API key for the selected Observer model. Open Settings."
             )
         if not self.settings.key_for_model(self.settings.responder_model):
             self.overlay.append_system(
@@ -214,7 +217,9 @@ class ChironApp(QObject):
         except OSError as error:
             logger.warning("Could not save settings on exit: %s", error)
         await asyncio.gather(
-            self.observer.stop(), self.responder.stop(), return_exceptions=True
+            self.observer.stop(timeout=90.0),
+            self.responder.stop(),
+            return_exceptions=True,
         )
         self.recorder.shutdown()
 
@@ -232,6 +237,33 @@ class ChironApp(QObject):
         return session_id
 
     def new_session(self) -> None:
+        if getattr(self.observer, "pending_frames", 0):
+            self._observer_drain_action = "new_session"
+            self.capture.set_watching(False)
+            self._invalidate_frames()
+            self.overlay.append_system(
+                "Draining captured Observer frames before starting the new session."
+            )
+            begin_drain = getattr(self.observer, "begin_drain", None)
+            if begin_drain is not None:
+                begin_drain()
+            self._schedule(self._drain_then_new_session())
+            return
+        self._finish_new_session()
+
+    async def _drain_then_new_session(self) -> None:
+        await self.observer.stop(timeout=90.0)
+        if getattr(self.observer, "pending_frames", 0):
+            self.overlay.append_system(
+                "⚠ New Session is waiting: fix or explicitly discard the retained "
+                "Observer batch first."
+            )
+            return
+        self._observer_drain_action = None
+        self._finish_new_session()
+
+    def _finish_new_session(self) -> None:
+        self._observer_drain_action = None
         self.recorder.close_session()
         if self.watch_requested:
             self.capture.set_watching(False)
@@ -255,6 +287,7 @@ class ChironApp(QObject):
         if self.watch_requested:
             self.ensure_session()
             self.recorder.record_watch(True)
+            self.observer.start()
 
     # --------------------------------------------------------------- history
 
@@ -350,7 +383,7 @@ class ChironApp(QObject):
             self.overlay.append_system(
                 "● Watch requested. Connecting Chiron-Observer before capture starts."
             )
-            if self.observer.status == "live":
+            if self.observer.accepting_frames:
                 self._activate_capture()
             else:
                 self.observer.start()
@@ -364,16 +397,22 @@ class ChironApp(QObject):
         self.overlay.set_watching(False, self.settings.hotkeys.toggle_watching)
         self.recorder.record_watch(False)
         self.overlay.append_system(
-            "○ Stopped watching. Chiron-Responder can still answer from the "
-            "existing journal and conversation."
+            "○ Stopped capturing. Chiron-Responder can still answer from the "
+            "existing journal and conversation; already buffered frames may finish "
+            "their final review."
         )
+        begin_drain = getattr(self.observer, "begin_drain", None)
+        if begin_drain is not None:
+            begin_drain()
         self._schedule(self.observer.stop())
 
     def toggle_watching(self) -> None:
         self.set_watching(not self.watch_requested)
 
     def _activate_capture(self) -> None:
-        if not self.watch_requested or self.observer.status != "live":
+        if not self.watch_requested or not self.observer.accepting_frames:
+            return
+        if self.capture_active:
             return
         self._invalidate_frames()
         self.capture.set_watching(True)
@@ -381,10 +420,14 @@ class ChironApp(QObject):
 
     def _on_observer_status(self, status: str, detail: str) -> None:
         self.overlay.set_status(status, f"Observer: {detail}" if detail else "Observer")
-        if status == "live" and self.watch_requested:
+        pending = getattr(self.observer, "pending_frames", 0)
+        self.overlay.set_observer_recovery(
+            pending if status in {"error", "incompatible"} else 0
+        )
+        if self.observer.accepting_frames and self.watch_requested:
             self._activate_capture()
             return
-        if status != "live":
+        if not self.observer.accepting_frames:
             self.capture.set_watching(False)
             self._invalidate_frames()
             self._flush_waiting_immediate()
@@ -435,7 +478,7 @@ class ChironApp(QObject):
             return
         self._waiting_immediate = None
         question = waiting[1]
-        if self.capture_active and self.observer.status == "live":
+        if self.capture_active and self.observer.accepting_frames:
             self.observer.observe(frame, "immediate")
             self._submit_question(question, frame)
         else:
@@ -456,14 +499,19 @@ class ChironApp(QObject):
         return ObserverStatus(
             state=state,
             watch_requested=self.watch_requested,
+            mode=getattr(self.observer, "mode", "live"),
+            accepting_frames=self.observer.accepting_frames,
+            last_sampled_at=getattr(self.observer, "last_sampled_at", None),
             last_observed_at=self.observer.last_observed_at,
+            pending_frames=getattr(self.observer, "pending_frames", 0),
+            next_process_at=getattr(self.observer, "next_process_at", None),
             detail=self.observer.status_detail,
         )
 
     # --------------------------------------------------------------- frames
 
     def _on_scheduled_frame(self, frame: Frame) -> None:
-        if not self.capture_active or self.observer.status != "live":
+        if not self.capture_active or not self.observer.accepting_frames:
             return
         self._latest_frame = frame
         self.observer.observe(frame, "scheduled")
@@ -594,9 +642,19 @@ class ChironApp(QObject):
             shutter = f"paused ({self.observer.status})"
         else:
             shutter = f"fixed {self.settings.capture.interval_seconds:g}s"
+        review = ""
+        pending = getattr(self.observer, "pending_frames", 0)
+        next_process = getattr(self.observer, "next_process_at", None)
+        if pending:
+            review += f"  ·  {pending} frames pending"
+        if next_process is not None:
+            remaining = max(0, int(next_process - time.time()))
+            minutes, seconds = divmod(remaining, 60)
+            countdown = f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+            review += f"  ·  next review in {countdown}"
         self.overlay.set_footer(
             f"capture: {shutter}  ·  Observer frames: {self.observer.frames_sent}"
-            f"  ·  journal: {len(self.journal)}"
+            f"{review}  ·  journal: {len(self.journal)}"
         )
 
     # -------------------------------------------------------------- settings
@@ -622,6 +680,21 @@ class ChironApp(QObject):
         except ValueError as error:
             self.overlay.append_system(f"⚠ Settings were not applied: {error}")
             return
+        missing = [
+            role
+            for role, model_id in (
+                ("Observer", new_settings.observer_model),
+                ("Responder", new_settings.responder_model),
+            )
+            if not new_settings.key_for_model(model_id)
+        ]
+        if missing:
+            self.overlay.append_system(
+                "⚠ Settings were not applied: missing API key for "
+                + " and ".join(missing)
+                + "."
+            )
+            return
         previous = self.settings
         self._remember_geometry()
         new_settings.overlay.position_x = previous.overlay.position_x
@@ -644,7 +717,9 @@ class ChironApp(QObject):
             self.watch_requested, new_settings.hotkeys.toggle_watching
         )
         self.overlay.set_hide_hint(new_settings.hotkeys.toggle_overlay)
-        self.observer.apply_settings(new_settings)
+        replace_observer = previous.observer_model != new_settings.observer_model
+        if not replace_observer:
+            self.observer.apply_settings(new_settings)
         self.responder.apply_settings(new_settings)
         self.journal_compactor.apply_settings(new_settings)
         self.recorder.record_settings_changed(
@@ -652,7 +727,10 @@ class ChironApp(QObject):
         )
 
         if previous.requires_observer_reconnect(new_settings):
-            self._schedule(self._reconnect_observer())
+            if replace_observer:
+                self._schedule(self._replace_observer())
+            else:
+                self._schedule(self._reconnect_observer())
         if previous.requires_responder_rebuild(new_settings):
             self._schedule(self._rebuild_responder())
         self.overlay.append_system("Settings saved.")
@@ -663,6 +741,80 @@ class ChironApp(QObject):
         self._flush_waiting_immediate()
         await self.observer.stop()
         if self.watch_requested:
+            self.observer.start()
+
+    async def _replace_observer(self) -> None:
+        """Drain the old transport/model before constructing its replacement."""
+        self.capture.set_watching(False)
+        self._invalidate_frames()
+        self._flush_waiting_immediate()
+        old = self.observer
+        await old.stop(timeout=90.0)
+        if getattr(old, "pending_frames", 0):
+            self._observer_drain_action = "replace_observer"
+            self.overlay.append_system(
+                "⚠ Observer change is waiting: the old captured batch must be "
+                "retried or explicitly discarded first."
+            )
+            return
+        self._install_observer_replacement(old)
+
+    def _install_observer_replacement(self, old) -> None:
+        """Install the already-selected Observer after its predecessor drained."""
+        self._observer_drain_action = None
+        detected, session_id = old.detected_game, old.session_id
+        self.observer = build_observer(
+            self.settings,
+            self.journal_service,
+            self.journal_compactor,
+            parent=self,
+        )
+        self.observer.detected_game = detected
+        self.observer.session_id = session_id
+        self._connect_observer()
+        if self.watch_requested:
+            self.observer.start()
+
+    def retry_observer_batch(self) -> None:
+        self._schedule(self._retry_observer_batch())
+
+    async def _retry_observer_batch(self) -> None:
+        retry = getattr(self.observer, "retry_retained_and_wait", None)
+        if retry is None:
+            return
+        try:
+            completed = await retry(self.settings, timeout=90.0)
+        except Exception as error:  # invalid retry transport remains visible
+            self.overlay.append_system(f"⚠ Observer batch was not retried: {error}")
+            return
+        if not completed:
+            return
+        self.overlay.set_observer_recovery(0)
+        await self._finish_observer_drain_action()
+
+    def discard_observer_batch(self) -> None:
+        discard = getattr(self.observer, "discard_retained", None)
+        if discard is None:
+            return
+        count = discard()
+        self.overlay.set_observer_recovery(0)
+        self.overlay.append_system(
+            f"Discarded {count} captured Observer frames; they cannot be recovered."
+        )
+        self.recorder.record_status(
+            "discarded",
+            f"{count} captured frames were not observed",
+            agent_id="observer",
+        )
+        self._schedule(self._finish_observer_drain_action())
+
+    async def _finish_observer_drain_action(self) -> None:
+        action, self._observer_drain_action = self._observer_drain_action, None
+        if action == "new_session":
+            self._finish_new_session()
+        elif action == "replace_observer":
+            self._install_observer_replacement(self.observer)
+        elif self.watch_requested and not self.observer.accepting_frames:
             self.observer.start()
 
     async def _rebuild_responder(self) -> None:

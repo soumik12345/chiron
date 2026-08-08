@@ -19,6 +19,7 @@ from chiron.models.catalogue import (
     describe_unknown,
     find_model,
     list_google_models,
+    observer_models,
 )
 from chiron.models.providers import GOOGLE, LIVE, OPENROUTER, provider_for_model
 
@@ -49,6 +50,8 @@ def test_a_chat_only_model_becomes_an_ai_studio_entry():
     assert [(m.id, m.provider, m.is_live) for m in models] == [
         ("gemini/gemini-2.5-flash", GOOGLE, False)
     ]
+    assert models[0].supports_video is True
+    assert models[0].supports_structured_output is True
 
 
 def test_a_model_serving_both_methods_is_offered_as_both():
@@ -86,6 +89,20 @@ def test_openrouter_entries_report_their_modalities():
     )
     assert seeing.supports_vision is True and seeing.is_live is False
     assert blind.supports_vision is False
+
+
+def test_openrouter_video_and_structured_output_are_advertised_explicitly():
+    model = _parse_openrouter(
+        {
+            "id": "google/gemini-video",
+            "pricing": {},
+            "architecture": {"input_modalities": ["text", "video"]},
+            "supported_parameters": ["response_format"],
+        }
+    )
+    assert model.supports_video is True
+    assert model.supports_structured_output is True
+    assert observer_models([model]) == [model]
 
 
 # -------------------------------------------------------------------- labels

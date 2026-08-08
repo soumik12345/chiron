@@ -304,6 +304,33 @@ def test_an_old_observer_run_still_rescans_and_renders(tmp_path):
     assert "looked (heartbeat)" in render_events(store.read_events())
 
 
+def test_v4_observer_run_incremental_count_matches_rescan_and_renders(tmp_path):
+    recorder = SessionRecorder(tmp_path / "sessions")
+    session_id = recorder.ensure_session(game="Hades", mode="dual_agent")
+    recorder.record_observer_run(
+        {
+            "agent_id": "observer",
+            "batch_id": "batch-1",
+            "seal_reason": "final_flush",
+            "first_captured_at": 100.0,
+            "last_captured_at": 105.0,
+            "source_frame_count": 2,
+            "encoded_part_count": 1,
+            "journal_entry_count": 1,
+            "successful_call_ids": ["call-1"],
+            "last_observed_at": 105.0,
+        }
+    )
+    recorder.flush()
+    store = recorder.store_for(session_id)
+    assert store is not None
+    assert recorder.row_for(session_id).observer_runs == 1
+    assert summarise(store).observer_runs == 1
+    rendered = render_events(store.read_events())
+    assert "final_flush" in rendered
+    assert "1 entries" in rendered
+
+
 def test_costs_roll_up_by_model_and_by_kind(recorder):
     recorder.ensure_session(mode="nonlive")
     recorder.record_llm_call(

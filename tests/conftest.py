@@ -36,6 +36,7 @@ class ObserverSpy:
             frameSent = Signal(object, str)
             compacted = Signal(object)
             llmCall = Signal(object)
+            observerRan = Signal(object)
 
         self.signals = Signals()
         for name in (
@@ -44,16 +45,21 @@ class ObserverSpy:
             "frameSent",
             "compacted",
             "llmCall",
+            "observerRan",
         ):
             setattr(self, name, getattr(self.signals, name))
         self.status = "idle"
         self.status_detail = ""
+        self.mode = "live"
         self.starts = 0
         self.stops = 0
         self.memory_resets = 0
         self.detected_game = ""
         self.session_id = ""
         self.last_observed_at = None
+        self.last_sampled_at = None
+        self.pending_frames = 0
+        self.next_process_at = None
         self.frames: list[tuple[object, str]] = []
 
     def start(self) -> None:
@@ -71,14 +77,20 @@ class ObserverSpy:
     def observe(self, frame, reason: str = "scheduled") -> None:
         self.frames.append((frame, reason))
         self.frames_sent += 1
+        self.last_sampled_at = frame.captured_at
         self.last_observed_at = frame.captured_at
         self.frameSent.emit(frame, reason)
 
     def reset_memory(self) -> None:
         self.memory_resets += 1
         self.last_observed_at = None
+        self.last_sampled_at = None
 
     def apply_settings(self, settings) -> None: ...
+
+    @property
+    def accepting_frames(self) -> bool:
+        return self.status == "live"
 
 
 class ResponderSpy:
@@ -144,7 +156,9 @@ def app(qapp, tmp_path, monkeypatch):
     for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     instance = ChironApp(
-        Settings(), tmp_path / "settings.json", sessions_root=tmp_path / "sessions"
+        Settings(api_key="test-key"),
+        tmp_path / "settings.json",
+        sessions_root=tmp_path / "sessions",
     )
     instance.observer = ObserverSpy()
     instance.responder = ResponderSpy()

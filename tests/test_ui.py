@@ -29,6 +29,17 @@ def test_overlay_starts_empty(overlay):
     assert overlay.transcript.toPlainText().strip() == ""
 
 
+def test_retained_observer_actions_are_visible_only_while_needed(overlay):
+    assert overlay.observer_retry_button.isHidden() is True
+    assert overlay.observer_discard_button.isHidden() is True
+    overlay.set_observer_recovery(12)
+    assert overlay.observer_retry_button.isHidden() is False
+    assert overlay.observer_discard_button.isHidden() is False
+    assert "12" in overlay.observer_discard_button.toolTip()
+    overlay.set_observer_recovery(0)
+    assert overlay.observer_retry_button.isHidden() is True
+
+
 def test_streaming_builds_one_message(overlay):
     overlay.append_user("what killed me?")
     overlay.start_response()
@@ -172,8 +183,33 @@ def test_saving_emits_the_new_settings(settings_window):
     received = []
     settings_window.settingsSaved.connect(received.append)
     settings_window.game_name_edit.setText("Hades")
+    settings_window.api_key_edit.setText("google-key")
     settings_window._save()
     assert received[0].game_name == "Hades"
+
+
+def test_save_blocks_only_keys_required_by_selected_agents(settings_window):
+    received = []
+    settings_window.settingsSaved.connect(received.append)
+    settings_window._save()
+    assert received == []
+    assert "missing API key for Observer and Responder" in (
+        settings_window.restart_badge.text()
+    )
+
+    settings_window.openrouter_key_edit.setText("router-key")
+    settings_window.observer_model_picker.choose("openrouter/google/gemini-2.5-flash")
+    settings_window.responder_model_picker.choose("openrouter/google/gemini-2.5-flash")
+    settings_window._save()
+    assert received[-1].api_key == ""
+    assert received[-1].observer_model.startswith("openrouter/")
+
+
+def test_process_cadence_is_only_enabled_for_batched_observer(settings_window):
+    assert settings_window.process_interval_spin.isEnabled() is True
+    live = Settings(observer_model="live/gemini-3.1-flash-live-preview")
+    settings_window.load(live)
+    assert settings_window.process_interval_spin.isEnabled() is False
 
 
 def test_a_live_responder_id_is_rejected_on_save(settings_window):
@@ -269,11 +305,12 @@ def test_refreshing_the_catalogue_keeps_the_current_selection(settings_window):
     assert settings_window.collect().responder_model == "openrouter/typed/by-hand"
 
 
-def test_agent_pickers_are_disjoint(settings_window):
+def test_agent_pickers_reflect_each_agents_transport_contract(settings_window):
     observer_ids = settings_window.observer_model_picker.model_ids()
     responder_ids = settings_window.responder_model_picker.model_ids()
     assert observer_ids and responder_ids
-    assert all(model_id.startswith("live/") for model_id in observer_ids)
+    assert any(model_id.startswith("live/") for model_id in observer_ids)
+    assert any(model_id.startswith("gemini/") for model_id in observer_ids)
     assert all(not model_id.startswith("live/") for model_id in responder_ids)
 
 

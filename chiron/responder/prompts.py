@@ -54,11 +54,20 @@ def observer_context(status: ObserverStatus) -> str:
     else:
         age = max(0.0, time.time() - status.last_observed_at)
         observed = f"{age:.1f} seconds ago"
+    if status.last_sampled_at is None:
+        sampled = "never in this gameplay session"
+    else:
+        age = max(0.0, time.time() - status.last_sampled_at)
+        sampled = f"{age:.1f} seconds ago"
     return "\n".join(
         [
+            f"mode: {status.mode}",
             f"state: {status.state}",
             f"watch requested: {'yes' if status.watch_requested else 'no'}",
-            f"last successful observation: {observed}",
+            f"accepting frames: {'yes' if status.accepting_frames else 'no'}",
+            f"newest frame processed by Observer: {observed}",
+            f"newest frame sampled for Observer: {sampled}",
+            f"pending Observer frames: {status.pending_frames}",
             f"stale: {'yes' if status.stale else 'no'}",
             f"detail: {status.detail or '(none)'}",
         ]

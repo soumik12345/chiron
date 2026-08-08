@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from typing import Any
 
@@ -47,6 +48,8 @@ from chiron.ui.model_picker import ModelPicker, format_context
 from chiron.ui.theme import PALETTE, settings_stylesheet
 
 logger = logging.getLogger(__name__)
+
+BATCHED_TOKENS_PER_FRAME = {"low": 66, "medium": 258, "high": 258}
 
 
 def _version() -> str:
@@ -228,19 +231,19 @@ class SettingsWindow(QWidget):
     def _build_agents_page(self) -> QWidget:
         page, layout = self._page(
             "Two agents",
-            "Chiron-Observer always watches through Gemini Live. "
-            "Chiron-Responder answers through an ordinary multimodal model.",
+            "Chiron-Observer writes the journal through Live checkpoints or "
+            "buffered video reviews. Chiron-Responder alone answers the player.",
         )
         form = self._section(layout, "Credentials")
         self.api_key_edit = self._wire(QLineEdit(), "textEdited")
         self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.api_key_edit.setPlaceholderText("AIza… (required)")
+        self.api_key_edit.setPlaceholderText("AIza… (for Live/Gemini models)")
         form.addRow("Google AI Studio key", self.api_key_edit)
         self.key_source_label = self._hint(form)
         self._hint(
             form,
-            "Required. One Google key authorizes the Live Observer and Google "
-            "Responder models. Environment fallbacks: GEMINI_API_KEY, GOOGLE_API_KEY.",
+            "Required only when either selected agent uses Live or Google AI Studio. "
+            "Environment fallbacks: GEMINI_API_KEY, GOOGLE_API_KEY.",
         )
         self.openrouter_key_edit = self._wire(QLineEdit(), "textEdited")
         self.openrouter_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -248,15 +251,15 @@ class SettingsWindow(QWidget):
         form.addRow("OpenRouter key", self.openrouter_key_edit)
         self._hint(
             form,
-            "Optional Responder backend. It never replaces the required Gemini "
-            "Live Observer.",
+            "Required when either selected agent uses OpenRouter. An OpenRouter-only "
+            "installation does not need a Google key.",
         )
 
         form = self._section(layout, "Chiron-Observer")
         self.observer_model_picker = self._wire(ModelPicker(), "selectionChanged")
-        form.addRow("Live model", self._model_row(self.observer_model_picker))
+        form.addRow("Observer model", self._model_row(self.observer_model_picker))
         self.observer_note_label = self._hint(
-            form, "Only Google Live models are offered."
+            form, "Live and known video-capable batched models are offered."
         )
         self.observer_prompt_edit = self._wire(QPlainTextEdit(), "textChanged")
         self.observer_prompt_edit.setFixedHeight(70)
@@ -317,7 +320,17 @@ class SettingsWindow(QWidget):
         self.interval_spin.setSingleStep(0.5)
         self.interval_spin.setSuffix(" s")
         form.addRow("Capture every", self.interval_spin)
-        self._hint(form, "Gemini Live accepts at most one video frame per second.")
+        self._hint(form, "Every accepted capture is preserved for the Observer.")
+        self.process_interval_spin = self._wire(QSpinBox(), "valueChanged")
+        self.process_interval_spin.setRange(30, 1800)
+        self.process_interval_spin.setSingleStep(30)
+        self.process_interval_spin.setSuffix(" s")
+        form.addRow("Process every", self.process_interval_spin)
+        self.process_interval_hint = self._hint(
+            form,
+            "Batched Observer only. Watch off stops new captures but drains an "
+            "already buffered final review.",
+        )
         self.question_policy_combo = self._wire(QComboBox(), "currentIndexChanged")
         self.question_policy_combo.addItem("Latest scheduled frame", "latest")
         self.question_policy_combo.addItem("Immediate new frame", "immediate")
@@ -338,11 +351,11 @@ class SettingsWindow(QWidget):
         form.addRow("Capture width", self.frame_width_spin)
         self.media_res_combo = self._wire(QComboBox(), "currentTextChanged")
         self.media_res_combo.addItems(["low", "medium", "high"])
-        form.addRow("Observer media resolution", self.media_res_combo)
+        form.addRow("Observer detail", self.media_res_combo)
         self._hint(
             form,
-            "Width controls JPEG dimensions sent to both agents. Media resolution "
-            "independently controls the Live Observer token budget.",
+            "Width controls captured JPEGs. Detail controls Live visual budget or "
+            "the batched time-lapse target (512/768/1152 px, never upscaled).",
         )
         self.jpeg_quality_spin = self._wire(QSpinBox(), "valueChanged")
         self.jpeg_quality_spin.setRange(10, 95)
@@ -447,8 +460,9 @@ class SettingsWindow(QWidget):
         page, layout = self._page("About", f"Chiron {_version()}")
         label = QLabel(
             f"Settings: {default_settings_path()}\n"
-            "Linux/X11 only. Chiron-Observer uses Gemini Live; "
-            "Chiron-Responder uses Google AI Studio or OpenRouter."
+            "Linux/X11 only. Chiron-Observer uses Live or ephemeral in-memory "
+            "batched video; Chiron-Responder uses Google AI Studio or OpenRouter. "
+            "A crash can lose an unfinished in-memory Observer batch."
         )
         label.setWordWrap(True)
         layout.addWidget(label)
@@ -476,6 +490,7 @@ class SettingsWindow(QWidget):
                 max(0, self.monitor_combo.findData(capture.monitor_index))
             )
             self.interval_spin.setValue(capture.interval_seconds)
+            self.process_interval_spin.setValue(round(capture.process_interval_seconds))
             self.question_policy_combo.setCurrentIndex(
                 max(
                     0,
@@ -527,6 +542,7 @@ class SettingsWindow(QWidget):
         if monitor is not None:
             settings.capture.monitor_index = int(monitor)
         settings.capture.interval_seconds = self.interval_spin.value()
+        settings.capture.process_interval_seconds = self.process_interval_spin.value()
         settings.capture.question_frame_policy = (
             self.question_policy_combo.currentData()
         )
@@ -553,6 +569,19 @@ class SettingsWindow(QWidget):
             settings = Settings.model_validate(self.collect().model_dump())
         except ValueError as error:
             self.restart_badge.setText(f"Cannot save: {error}")
+            return
+        missing = [
+            role
+            for role, model_id in (
+                ("Observer", settings.observer_model),
+                ("Responder", settings.responder_model),
+            )
+            if not settings.key_for_model(model_id)
+        ]
+        if missing:
+            self.restart_badge.setText(
+                "Cannot save: missing API key for " + " and ".join(missing) + "."
+            )
             return
         self.settings = settings.copy_deep()
         self.settingsSaved.emit(settings)
@@ -591,19 +620,37 @@ class SettingsWindow(QWidget):
             )
         )
         interval = edited.capture.interval_seconds
-        tokens = TOKENS_PER_FRAME.get(edited.capture.media_resolution, 260)
+        process_interval = edited.capture.process_interval_seconds
+        batched = not edited.observer_model.startswith("live/")
+        self.process_interval_spin.setEnabled(batched)
+        self.process_interval_hint.setVisible(batched)
+        token_table = BATCHED_TOKENS_PER_FRAME if batched else TOKENS_PER_FRAME
+        tokens = token_table.get(edited.capture.media_resolution, 260)
         per_minute = (60.0 / interval) * tokens
-        model = find_model(self._models, edited.responder_model)
+        model = find_model(self._models, edited.observer_model)
         price = (
-            f"Responder: ${model.prompt_price * 1_000_000:.2f}/M input, "
+            f"Observer: ${model.prompt_price * 1_000_000:.2f}/M input, "
             f"${model.completion_price * 1_000_000:.2f}/M output."
             if model and model.pricing_known
-            else "Responder pricing unavailable for this selection."
+            else "Observer pricing unavailable for this selection."
         )
-        self.burn_label.setText(
-            f"Observer cadence: about {per_minute:,.0f} visual tokens/minute at "
-            f"{interval:g}s. {price}"
-        )
+        if batched:
+            estimated_frames = math.ceil(process_interval / interval)
+            cap_note = (
+                " The 300-frame early seal applies." if estimated_frames > 300 else ""
+            )
+            observer_estimate = (
+                f"Normal batch: ~{estimated_frames} frames, "
+                f"{3600 / process_interval:.1f} calls/hour; about "
+                f"{per_minute:,.0f} visual tokens/minute before prompt/output."
+                f"{cap_note}"
+            )
+        else:
+            observer_estimate = (
+                f"Live cadence: about {per_minute:,.0f} visual tokens/minute "
+                f"at {interval:g}s."
+            )
+        self.burn_label.setText(f"{observer_estimate} {price}")
         known = find_model(self._models, edited.responder_model)
         if known is None:
             note = (
@@ -615,11 +662,20 @@ class SettingsWindow(QWidget):
         else:
             note = ""
         self.responder_note_label.setText(note)
-        self.observer_note_label.setText(
-            "Observer model must be a live/ Google model."
-            if not edited.observer_model.startswith("live/")
-            else "Only record_event is exposed; content/audio output is discarded."
-        )
+        observer = find_model(self._models, edited.observer_model)
+        if edited.observer_model.startswith("live/"):
+            observer_note = (
+                "Only record_event is exposed; content/audio output is discarded."
+            )
+        elif observer is None:
+            observer_note = (
+                "Video and structured output are unverified for this typed model id."
+            )
+        elif not observer.supports_video or not observer.supports_structured_output:
+            observer_note = "This route does not advertise all batched capabilities."
+        else:
+            observer_note = "Batched: video input and structured output advertised."
+        self.observer_note_label.setText(observer_note)
         observer_window = resolve_context_window(edited.observer_model)
         responder_window = resolve_context_window(edited.responder_model)
         self.journal_observer_context_label.setText(

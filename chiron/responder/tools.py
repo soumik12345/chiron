@@ -45,6 +45,12 @@ class ReadJournalTool(Tool):
             "last_observed_at": (
                 datetime.fromtimestamp(observed).isoformat() if observed else None
             ),
+            "last_sampled_at": (
+                datetime.fromtimestamp(self.observer_status.last_sampled_at).isoformat()
+                if self.observer_status.last_sampled_at
+                else None
+            ),
+            "pending_frames": self.observer_status.pending_frames,
             "stale": self.observer_status.stale,
         }
 

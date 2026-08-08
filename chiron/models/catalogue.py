@@ -96,6 +96,10 @@ class ModelInfo:
             same reason: this flag is only ever used to *warn* (the literary research
             agent looks at illustrations), and warning on an absence of evidence would
             cry wolf on every model a catalogue happens not to describe.
+        supports_video (bool): Whether ordinary requests accept video input.
+        supports_structured_output (bool): Whether the route advertises strict
+            response formatting. Unknown catalogue entries deliberately leave
+            both flags false so the UI can warn rather than promise compatibility.
         is_live (bool): Whether this entry runs over the Live API — a persistent
             websocket — rather than a request/response endpoint. Carried
             explicitly rather than derived from the prefix because it is the one
@@ -113,6 +117,8 @@ class ModelInfo:
     pricing_known: bool
     supports_tools: bool
     supports_vision: bool = True
+    supports_video: bool = False
+    supports_structured_output: bool = False
     is_live: bool = False
 
     def label(self) -> str:
@@ -123,8 +129,14 @@ class ModelInfo:
         prints "$0.00" for a model it simply has no rate for is worse than one
         that says nothing.
         """
-        mode = "live" if self.is_live else "non-live"
-        parts = [_PROVIDER_LABELS.get(self.provider, self.provider), self.id, mode]
+        mode = "Live" if self.is_live else "Batched (non-live)"
+        media = "video" if self.supports_video or self.is_live else "video unverified"
+        parts = [
+            _PROVIDER_LABELS.get(self.provider, self.provider),
+            self.id,
+            mode,
+            media,
+        ]
         if self.pricing_known:
             parts.append(
                 f"${self.prompt_price * 1_000_000:.2f}/"
@@ -215,6 +227,13 @@ def _parse_openrouter(entry: dict) -> ModelInfo | None:
             if isinstance(modalities, list) and modalities
             else True
         ),
+        supports_video=(
+            "video" in modalities
+            if isinstance(modalities, list) and modalities
+            else False
+        ),
+        supports_structured_output=isinstance(params, list)
+        and any(name in params for name in ("response_format", "structured_outputs")),
     )
 
 
@@ -302,6 +321,11 @@ def _parse_google(entry: dict) -> list[ModelInfo]:
         "completion_price": pricing.completion if pricing else 0.0,
         "pricing_known": pricing is not None,
         "supports_tools": not any(marker in lowered for marker in _NO_TOOL_MARKERS),
+        # The list endpoint does not expose modality or response-schema flags.
+        # Ordinary Gemini generation is the official multimodal/structured seam;
+        # actual route acceptance remains covered by credential-gated smoke tests.
+        "supports_video": _CHAT_METHOD in methods,
+        "supports_structured_output": _CHAT_METHOD in methods,
     }
 
     models: list[ModelInfo] = []
@@ -407,6 +431,7 @@ STATIC_MODELS: list[ModelInfo] = [
         completion_price=0.0,
         pricing_known=False,
         supports_tools=True,
+        supports_video=True,
         is_live=True,
     ),
     ModelInfo(
@@ -420,6 +445,8 @@ STATIC_MODELS: list[ModelInfo] = [
         completion_price=7.50 / 1_000_000,
         pricing_known=True,
         supports_tools=True,
+        supports_video=True,
+        supports_structured_output=True,
     ),
     ModelInfo(
         id="gemini/gemini-2.5-flash",
@@ -432,6 +459,22 @@ STATIC_MODELS: list[ModelInfo] = [
         completion_price=2.50 / 1_000_000,
         pricing_known=True,
         supports_tools=True,
+        supports_video=True,
+        supports_structured_output=True,
+    ),
+    ModelInfo(
+        id="gemini/gemini-2.5-flash-lite",
+        provider=GOOGLE,
+        provider_model_id="gemini-2.5-flash-lite",
+        name="Gemini 2.5 Flash Lite",
+        vendor="google",
+        context_length=1_000_000,
+        prompt_price=0.10 / 1_000_000,
+        completion_price=0.40 / 1_000_000,
+        pricing_known=True,
+        supports_tools=True,
+        supports_video=True,
+        supports_structured_output=True,
     ),
     ModelInfo(
         id="openrouter/google/gemini-2.5-flash",
@@ -444,6 +487,8 @@ STATIC_MODELS: list[ModelInfo] = [
         completion_price=2.50 / 1_000_000,
         pricing_known=True,
         supports_tools=True,
+        supports_video=True,
+        supports_structured_output=True,
     ),
 ]
 
@@ -472,16 +517,18 @@ def available_models(
         force (bool): Skip the disk caches and re-fetch.
 
     Returns:
-        list[ModelInfo]: Live Observer entries followed by non-live Responder
-            entries. Falls back to applicable static entries when catalogue
-            fetches yield nothing.
+        list[ModelInfo]: Live and ordinary multimodal entries used by the two
+            role-specific picker filters. Falls back to applicable static entries
+            when catalogue fetches yield nothing.
     """
     models: list[ModelInfo] = list(
         list_google_models(google_key, force=force) if google_key else []
     )
     if openrouter_key:
         models.extend(
-            m for m in list_models(force=force) if m.supports_vision and not m.is_live
+            m
+            for m in list_models(force=force)
+            if (m.supports_vision or m.supports_video) and not m.is_live
         )
     if not models:
         return [
@@ -537,8 +584,18 @@ def find_model(models: list[ModelInfo], model_id: str) -> ModelInfo | None:
 
 
 def observer_models(models: list[ModelInfo]) -> list[ModelInfo]:
-    """Gemini Live entries that can be selected for Chiron-Observer."""
-    return [model for model in models if model.is_live and model.provider == LIVE]
+    """Live and known video-capable batched Observer selections."""
+    return [
+        model
+        for model in models
+        if (model.is_live and model.provider == LIVE)
+        or (
+            not model.is_live
+            and model.provider in {GOOGLE, OPENROUTER}
+            and model.supports_video
+            and (model.provider != OPENROUTER or model.supports_structured_output)
+        )
+    ]
 
 
 def responder_models(
@@ -581,6 +638,8 @@ def describe_unknown(model_id: str) -> ModelInfo:
         vendor="custom",
         context_length=None,
         pricing_known=False,
+        supports_video=False,
+        supports_structured_output=False,
         is_live=bool(provider and provider.is_live),
     )
 

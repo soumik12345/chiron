@@ -18,10 +18,11 @@ defaults, so a settings file written by an older build still opens; a file that
 is outright unparseable is reported and replaced by defaults rather than being
 allowed to stop the app from starting.
 
-Chiron v3 always has two agents. ``observer_model`` names the required Gemini
-Live observer and ``responder_model`` names an ordinary Google AI Studio or
-OpenRouter completion model. Older selected-model settings are accepted by the
-pre-validator, but only the dual-agent shape is written back to disk.
+Chiron always has two agents. ``observer_model`` may name either the Gemini Live
+transport or an ordinary Google AI Studio/OpenRouter model used by the buffered
+Observer. ``responder_model`` always names an ordinary completion model. Older
+selected-model settings are accepted by the pre-validator, but only the current
+dual-agent shape is written back to disk.
 """
 
 from __future__ import annotations
@@ -47,8 +48,10 @@ LIVE_PREFIX = "live/"
 #: audio and content are discarded; only journal tool calls cross the boundary.
 DEFAULT_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 
-#: Provider-qualified defaults for the two v3 agents.
-DEFAULT_OBSERVER_MODEL = LIVE_PREFIX + DEFAULT_LIVE_MODEL
+#: Provider-qualified defaults for the two agents. Existing saved Live choices
+#: are retained by migration; this cheaper batched choice is only the fresh
+#: default.
+DEFAULT_OBSERVER_MODEL = "gemini/gemini-2.5-flash-lite"
 DEFAULT_RESPONDER_MODEL = "gemini/gemini-3.6-flash"
 
 #: Known Live API model ids, offered in the settings page combo box. The field is
@@ -68,11 +71,17 @@ OPENROUTER_API_KEY_ENV_VARS = ("OPENROUTER_API_KEY",)
 MediaResolution = Literal["low", "medium", "high"]
 ResponderMode = Literal["fixed_horizon", "react"]
 QuestionFramePolicy = Literal["latest", "immediate"]
+ObserverMode = Literal["live", "nonlive"]
 
 
 def is_live_selection(selection: str) -> bool:
     """Whether a provider-qualified selection names a Live API model."""
     return (selection or "").strip().startswith(LIVE_PREFIX)
+
+
+def observer_mode(selection: str) -> ObserverMode:
+    """The Observer transport selected by a provider-qualified model id."""
+    return "live" if is_live_selection(selection) else "nonlive"
 
 
 def live_model_id(selection: str) -> str:
@@ -102,8 +111,11 @@ class CaptureSettings(BaseModel):
         jpeg_quality (int): JPEG quality (1-95) for encoded frames.
         stamp_timestamp (bool): Draw the capture time into the frame's corner so
             the model has an explicit "now" to reason about.
-        media_resolution (MediaResolution): Gemini Live's Observer-side visual
-            token budget. It is independent of ``frame_width`` in v3.
+        process_interval_seconds (float): Seconds between buffered Observer
+            reviews. It is ignored by Live but retained when transports change.
+        media_resolution (MediaResolution): Transport-neutral Observer detail.
+            Live uses it as the server visual budget; batched observation maps it
+            to an encoder target width.
         watch_on_launch (bool): Begin watching the moment Chiron starts. Off by
             default: a screen recorder that switches itself on when you log in is
             not something anyone should have to opt out of.
@@ -111,6 +123,7 @@ class CaptureSettings(BaseModel):
 
     monitor_index: int = 1
     interval_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
+    process_interval_seconds: float = Field(default=300.0, ge=30.0, le=1800.0)
     question_frame_policy: QuestionFramePolicy = "latest"
     frame_width: int = Field(default=768, ge=256, le=1920)
     jpeg_quality: int = Field(default=60, ge=10, le=95)
@@ -204,8 +217,8 @@ class Settings(BaseModel):
             Studio. Empty means "look in the environment".
         openrouter_api_key (str): OpenRouter key. Empty means the environment,
             and no key at all means OpenRouter is simply absent from the picker.
-        observer_model (str): Provider-qualified Gemini Live model used only by
-            Chiron-Observer.
+        observer_model (str): Provider-qualified Live, Gemini, or OpenRouter model
+            used only by Chiron-Observer.
         responder_model (str): Non-live Google or OpenRouter model used only by
             Chiron-Responder.
         responder_mode (ResponderMode): Fixed-horizon or ReAct execution.
@@ -234,7 +247,7 @@ class Settings(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _migrate_dual_agents(cls, data: Any) -> Any:
-        """Accept v0-v2 settings and emit one unambiguous in-memory v3 shape."""
+        """Accept v0-v3 settings and emit one unambiguous current shape."""
         if not isinstance(data, dict):
             return data
         migrated = dict(data)
@@ -253,7 +266,9 @@ class Settings(BaseModel):
                 migrated["observer_model"] = selected
                 migrated.setdefault("responder_model", DEFAULT_RESPONDER_MODEL)
             else:
-                migrated["observer_model"] = DEFAULT_OBSERVER_MODEL
+                # The retired v2 non-live Observer cannot be inferred from its
+                # shared provider switch. Preserve v3's Live migration behavior.
+                migrated["observer_model"] = LIVE_PREFIX + DEFAULT_LIVE_MODEL
                 migrated["responder_model"] = selected
         else:
             observer = str(migrated.get("observer_model") or "").strip()
@@ -267,7 +282,7 @@ class Settings(BaseModel):
         # presence of the old selected-model switch disambiguates that shape;
         # the value was intentionally ignored above unless it was the selection.
         if is_legacy and not is_live_selection(selected):
-            migrated["observer_model"] = DEFAULT_OBSERVER_MODEL
+            migrated["observer_model"] = LIVE_PREFIX + DEFAULT_LIVE_MODEL
 
         capture = migrated.get("capture")
         if isinstance(capture, dict):
@@ -303,9 +318,12 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_agent_models(self) -> Settings:
-        """Keep the two provider roles structurally disjoint."""
-        if not is_live_selection(self.observer_model):
-            raise ValueError("observer_model must be a live/<gemini-model> id")
+        """Keep both roles on supported provider-qualified selections."""
+        observer = self.observer_model.strip()
+        if not observer.startswith(("live/", "gemini/", "openrouter/")):
+            raise ValueError(
+                "observer_model must use the live/, gemini/, or openrouter/ provider"
+            )
         responder = self.responder_model.strip()
         if not responder.startswith(("gemini/", "openrouter/")):
             raise ValueError(
@@ -362,7 +380,7 @@ class Settings(BaseModel):
     # --------------------------------------------------------------- capture
 
     def effective_frame_width(self) -> int:
-        """The one capture width delivered to both v3 agents."""
+        """The one capture width delivered to both agents."""
         return self.capture.frame_width
 
     def effective_capture(self) -> CaptureSettings:
@@ -378,14 +396,27 @@ class Settings(BaseModel):
         return Settings.model_validate(self.model_dump())
 
     def requires_observer_reconnect(self, other: Settings) -> bool:
-        """Whether Observer websocket configuration changed."""
+        """Whether the current Observer must reconnect or cross a batch boundary."""
         return (
             self.observer_model != other.observer_model
-            or self.resolved_api_key() != other.resolved_api_key()
+            or self.key_for_model(self.observer_model)
+            != other.key_for_model(other.observer_model)
             or self.game_name != other.game_name
             or self.observer_system_prompt != other.observer_system_prompt
             or self.capture.media_resolution != other.capture.media_resolution
+            or (
+                self.capture.process_interval_seconds
+                != other.capture.process_interval_seconds
+                and (
+                    observer_mode(self.observer_model) == "nonlive"
+                    or observer_mode(other.observer_model) == "nonlive"
+                )
+            )
         )
+
+    def requires_observer_swap(self, other: Settings) -> bool:
+        """Whether applying settings must replace the Observer implementation."""
+        return observer_mode(self.observer_model) != observer_mode(other.observer_model)
 
     def requires_responder_rebuild(self, other: Settings) -> bool:
         """Whether the Responder adapter must be rebuilt, preserving memory."""

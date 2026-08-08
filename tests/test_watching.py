@@ -201,6 +201,25 @@ def test_frame_width_and_live_media_resolution_are_independent(app):
     assert app.settings.capture.media_resolution == "high"
 
 
+def test_app_accepts_openrouter_only_agent_settings(app):
+    edited = app.settings.copy_deep()
+    edited.api_key = ""
+    edited.openrouter_api_key = "router-key"
+    edited.observer_model = "openrouter/google/gemini-2.5-flash"
+    edited.responder_model = "openrouter/google/gemini-2.5-flash"
+    app.apply_settings(edited)
+    assert app.settings.resolved_api_key() == ""
+    assert app.settings.key_for_model(app.settings.observer_model) == "router-key"
+
+
+def test_app_rejects_missing_selected_agent_credentials(app):
+    edited = app.settings.copy_deep()
+    edited.api_key = ""
+    app.apply_settings(edited)
+    assert app.settings.api_key == "test-key"
+    assert "missing API key" in app.overlay.transcript.toPlainText()
+
+
 def test_footer_distinguishes_requested_from_effective_watch(app):
     app.observer.start = lambda: None
     app.set_watching(True)
@@ -216,7 +235,7 @@ def test_new_session_clears_both_agents_and_keeps_watch_requested(app):
     app.new_session()
 
     assert app.watch_requested is True
-    assert app.capture_active is False
+    assert app.capture_active is True
     assert len(app.journal) == 0
     assert len(app.conversation) == 0
     assert app.observer.memory_resets == 1

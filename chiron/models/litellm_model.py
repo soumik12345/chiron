@@ -16,7 +16,13 @@ persistence concern; the backend supplies a sink that appends to a per-book ledg
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable
+
+# Model metadata is resolved by Chiron's own refreshable catalogue. LiteLLM's
+# import-time remote price-map fetch adds network I/O to otherwise offline paths;
+# use its bundled map unless the embedding process made an explicit choice.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 import litellm
 import weave
@@ -194,6 +200,8 @@ class LiteLLMModel(BaseModel):
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
         tool_choice: str | dict[str, Any] | None = None,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> Any:
         """Issue a (possibly streaming) chat completion via litellm.
 
@@ -209,6 +217,9 @@ class LiteLLMModel(BaseModel):
             stream (bool): Whether to request a streaming response. Defaults to False.
             tool_choice (str | dict | None): Provider tool-selection policy. When
                 omitted, tool-enabled calls use ``auto``.
+            response_format (dict | None): Provider response schema/format request.
+            extra_body (dict | None): Provider-specific request options merged with
+                Chiron's accounting options.
 
         Returns:
             Any: A litellm `ModelResponse` (non-streaming) or async generator
@@ -238,13 +249,20 @@ class LiteLLMModel(BaseModel):
             kwargs["api_key"] = self.api_key
         if self.reasoning_effort:
             kwargs["reasoning_effort"] = self.reasoning_effort
+        if response_format is not None:
+            kwargs["response_format"] = response_format
         if stream:
             kwargs["stream_options"] = {"include_usage": True}
+        provider_body = dict(extra_body or {})
         # Ask OpenRouter to include the real per-request cost in usage so we can
         # reconcile our pricing-table estimate against ground truth (no-op for
         # providers that ignore it).
         if "openrouter/" in self.model_id:
-            kwargs["extra_body"] = {"usage": {"include": True}}
+            usage = dict(provider_body.get("usage") or {})
+            usage["include"] = True
+            provider_body["usage"] = usage
+        if provider_body:
+            kwargs["extra_body"] = provider_body
         return await litellm.acompletion(**kwargs)
 
     def cost_for(self, prompt_tokens: int, completion_tokens: int) -> float:

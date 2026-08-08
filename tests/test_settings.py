@@ -10,7 +10,6 @@ import pytest
 from pydantic import ValidationError
 
 from chiron.config.settings import (
-    DEFAULT_OBSERVER_MODEL,
     DEFAULT_RESPONDER_MODEL,
     Settings,
     default_settings_path,
@@ -21,10 +20,11 @@ from chiron.config.settings import (
 
 def test_fresh_install_defaults_to_two_explicit_agents():
     settings = Settings()
-    assert settings.observer_model == DEFAULT_OBSERVER_MODEL
+    assert settings.observer_model == "gemini/gemini-2.5-flash-lite"
     assert settings.responder_model == "gemini/gemini-3.6-flash"
     assert settings.responder_mode == "fixed_horizon"
     assert settings.capture.interval_seconds == 5.0
+    assert settings.capture.process_interval_seconds == 300.0
     assert settings.capture.question_frame_policy == "latest"
 
 
@@ -101,6 +101,19 @@ def test_each_provider_resolves_its_own_key(monkeypatch):
     assert settings.key_for_model("openrouter/openai/gpt-4o") == "sk-or-router"
 
 
+def test_openrouter_only_agents_need_no_google_key(monkeypatch):
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    settings = Settings(
+        openrouter_api_key="router",
+        observer_model="openrouter/google/gemini-2.5-flash",
+        responder_model="openrouter/google/gemini-2.5-flash",
+    )
+    assert settings.resolved_api_key() == ""
+    assert settings.key_for_model(settings.observer_model) == "router"
+    assert settings.key_for_model(settings.responder_model) == "router"
+
+
 def test_openrouter_key_falls_back_to_environment(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-env")
     assert Settings().resolved_openrouter_key() == "sk-or-env"
@@ -111,9 +124,15 @@ def test_default_path_honours_xdg(monkeypatch, tmp_path):
     assert default_settings_path() == tmp_path / "chiron" / "settings.json"
 
 
-def test_observer_and_responder_model_roles_are_disjoint():
+def test_observer_supports_live_and_batched_but_responder_stays_nonlive():
+    assert Settings(observer_model="gemini/gemini-2.5-flash").observer_model.startswith(
+        "gemini/"
+    )
+    assert Settings(
+        observer_model="openrouter/google/gemini-2.5-flash"
+    ).observer_model.startswith("openrouter/")
     with pytest.raises(ValidationError, match="observer_model"):
-        Settings(observer_model="gemini/gemini-3.6-flash")
+        Settings(observer_model="anthropic/claude-sonnet-4")
     with pytest.raises(ValidationError, match="responder_model"):
         Settings(responder_model="live/gemini-3.1-flash-live-preview")
     with pytest.raises(ValidationError, match="gemini/ or openrouter/"):
@@ -133,10 +152,26 @@ def test_observer_restart_boundary_is_explicit():
         lambda s: setattr(s, "api_key", "two"),
         lambda s: setattr(s, "observer_system_prompt", "watch carefully"),
         lambda s: setattr(s.capture, "media_resolution", "high"),
+        lambda s: setattr(s.capture, "process_interval_seconds", 600),
     ):
         changed = current.copy_deep()
         edit(changed)
         assert current.requires_observer_reconnect(changed) is True
+
+
+def test_observer_swap_is_only_needed_when_transport_changes():
+    current = Settings()
+    same_transport = current.copy_deep()
+    same_transport.observer_model = "gemini/gemini-2.5-flash"
+    assert current.requires_observer_swap(same_transport) is False
+
+    live = current.copy_deep()
+    live.observer_model = "live/gemini-3.1-flash-live-preview"
+    assert current.requires_observer_swap(live) is True
+
+    live_cadence = live.copy_deep()
+    live_cadence.capture.process_interval_seconds = 600
+    assert live.requires_observer_reconnect(live_cadence) is False
 
 
 def test_responder_rebuild_boundary_preserves_unrelated_agent_changes():
@@ -196,7 +231,7 @@ def test_old_nonlive_selection_migrates_only_to_responder():
             "observer_model": "gemini/gemini-2.5-flash-lite",
         }
     )
-    assert loaded.observer_model == DEFAULT_OBSERVER_MODEL
+    assert loaded.observer_model == "live/gemini-3.1-flash-live-preview"
     assert loaded.responder_model == "openrouter/anthropic/claude-sonnet-4"
 
 

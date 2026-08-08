@@ -50,7 +50,7 @@ def is_permanent_error(error: BaseException) -> bool:
     )
 
 
-class ObserverSessionManager(QObject):
+class LiveObserverSessionManager(QObject):
     """Own one reconnecting Live socket with no transcript output surface."""
 
     statusChanged = Signal(str, str)
@@ -58,6 +58,7 @@ class ObserverSessionManager(QObject):
     frameSent = Signal(object, str)
     compacted = Signal(object)
     llmCall = Signal(object)
+    observerRan = Signal(object)
 
     def __init__(
         self,
@@ -72,9 +73,12 @@ class ObserverSessionManager(QObject):
         self.journal_compactor = journal_compactor
         self.status = "idle"
         self.status_detail = ""
+        self.mode = "live"
         self.detected_game = ""
         self.session_id = ""
+        self.last_sampled_at: float | None = None
         self.last_observed_at: float | None = None
+        self.next_process_at: float | None = None
 
         self._task: asyncio.Task[None] | None = None
         self._current_cycle: asyncio.Task[Any] | None = None
@@ -106,6 +110,14 @@ class ObserverSessionManager(QObject):
     @property
     def frames_sent(self) -> int:
         return self._frames_sent
+
+    @property
+    def accepting_frames(self) -> bool:
+        return self.status == "live" and not self._stopping
+
+    @property
+    def pending_frames(self) -> int:
+        return int(self._pending_frame is not None) + int(self._observation_in_flight)
 
     @property
     def compactions(self) -> int:
@@ -170,10 +182,12 @@ class ObserverSessionManager(QObject):
         if self.status != "live" or self._stopping:
             return
         self._pending_frame = (frame, reason)
+        self.last_sampled_at = frame.captured_at
         self._wake.set()
 
     def reset_memory(self) -> None:
         self._resumption_handle = None
+        self.last_sampled_at = None
         self.last_observed_at = None
         self._pending_frame = None
         self._observation_in_flight = False
@@ -545,8 +559,15 @@ class ObserverSessionManager(QObject):
         self.statusChanged.emit(status, detail)
 
 
+# Compatibility for imports from the v3 Live-only architecture. New application
+# wiring uses the explicit class name through the Observer factory.
+ObserverSessionManager = LiveObserverSessionManager
+
+
 __all__ = [
     "COMPACTION_TRIGGER_RATIO",
+    "LiveObserverSessionManager",
     "MEDIA_RESOLUTIONS",
     "ObserverSessionManager",
+    "is_permanent_error",
 ]

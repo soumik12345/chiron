@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSizeGrip,
     QSizePolicy,
@@ -187,6 +188,8 @@ class OverlayWindow(QWidget):
     sessionDeleted = Signal(str)
     sessionThumbnailsDeleted = Signal(str)
     journalToggled = Signal(bool)
+    observerRetryRequested = Signal()
+    observerDiscardRequested = Signal()
 
     def __init__(
         self, settings: OverlaySettings, parent: QWidget | None = None
@@ -277,6 +280,21 @@ class OverlayWindow(QWidget):
         self.status_text.setObjectName("statusText")
         row.addWidget(self.status_text)
         row.addStretch(1)
+
+        self.observer_retry_button = QToolButton(header)
+        self.observer_retry_button.setText("↻ Retry review")
+        self.observer_retry_button.setToolTip(
+            "Retry the retained screenshots after fixing model or credentials"
+        )
+        self.observer_retry_button.clicked.connect(self.observerRetryRequested.emit)
+        self.observer_retry_button.hide()
+        row.addWidget(self.observer_retry_button)
+
+        self.observer_discard_button = QToolButton(header)
+        self.observer_discard_button.setText("Discard")
+        self.observer_discard_button.clicked.connect(self._confirm_observer_discard)
+        self.observer_discard_button.hide()
+        row.addWidget(self.observer_discard_button)
 
         self.settings_button = QToolButton(header)
         self.settings_button.setText("⚙")
@@ -789,6 +807,29 @@ class OverlayWindow(QWidget):
         colour = STATUS_COLOURS.get(status, PALETTE["text_faint"])
         self.status_dot.setStyleSheet(f"color: {colour};")
         self.status_text.setText(f"{status} · {detail}" if detail else status)
+
+    def set_observer_recovery(self, pending_frames: int = 0) -> None:
+        """Expose explicit retry/discard actions only for a retained batch."""
+        visible = pending_frames > 0
+        self.observer_retry_button.setVisible(visible)
+        self.observer_discard_button.setVisible(visible)
+        self.observer_discard_button.setToolTip(
+            f"Permanently discard {pending_frames} captured Observer frames"
+            if visible
+            else ""
+        )
+
+    def _confirm_observer_discard(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Discard captured frames?",
+            "These already captured screenshots have not been observed. Discarding "
+            "them cannot be undone and may leave a gap in the gameplay journal.",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Discard:
+            self.observerDiscardRequested.emit()
 
     def set_footer(self, text: str) -> None:
         """Set the small status line under the input, keeping the cost on it.

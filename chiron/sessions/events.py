@@ -13,9 +13,9 @@ The types divide into three families:
   ``settings_changed``. Sessions and watching are independent axes: one session
   spans many watch spans, and without ``settings_changed`` the cost data is
   uninterpretable a week later.
-* **Content** — ``message``, ``journal_entry``, ``frame``, ``compaction`` and
-  ``agent_trace``. Legacy ``observer_run`` records remain readable but are no
-  longer emitted.
+* **Content** — ``message``, ``journal_entry``, ``observer_run``, ``frame``,
+  ``compaction`` and ``agent_trace``. Live v3 sessions emitted no
+  ``observer_run``; buffered v4 sessions use it again with an expanded payload.
 * **Money** — ``llm_call``, one serialised
   :class:`~chiron.models.usage.LLMCallRecord` per call, linked by ``call_id``
   from the attributed agent activity that caused it.
@@ -196,6 +196,18 @@ def journal_entry(
     }
 
 
+def observer_run(**payload: Any) -> dict[str, Any]:
+    """One successful buffered Observer batch, preserving extensible v4 fields."""
+    result = dict(payload)
+    result.setdefault("agent_id", "observer")
+    result.setdefault("seal_reason", str(result.get("reason") or "interval"))
+    result.setdefault("journal_entry_count", int(result.get("entries") or 0))
+    result.setdefault("source_frame_count", 0)
+    result.setdefault("encoded_part_count", 0)
+    result.setdefault("successful_call_ids", [])
+    return result
+
+
 def frame(
     *,
     frame_id: str,
@@ -271,6 +283,7 @@ __all__ = [
     "game",
     "journal_entry",
     "message",
+    "observer_run",
     "session_meta",
     "settings_changed",
     "status",

@@ -17,6 +17,7 @@ from chiron.capture.frames import encode_frame
 from chiron.config.settings import Settings, live_model_id
 from chiron.journal.log import JournalLog
 from chiron.journal.service import JournalService
+from chiron.observer.nonlive import NonLiveObserverSessionManager
 from chiron.observer.prompts import CHECKPOINT_INSTRUCTION
 from chiron.observer.session import ObserverSessionManager
 from chiron.responder.session import ResponderSessionManager
@@ -26,8 +27,11 @@ RUN_SMOKE = os.environ.get("CHIRON_RUN_PROVIDER_SMOKE") == "1"
 GOOGLE_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 pytestmark = pytest.mark.skipif(
-    not RUN_SMOKE or not GOOGLE_KEY,
-    reason="set CHIRON_RUN_PROVIDER_SMOKE=1 and GEMINI_API_KEY to run provider smoke tests",
+    not RUN_SMOKE,
+    reason="set CHIRON_RUN_PROVIDER_SMOKE=1 to run provider smoke tests",
+)
+google_smoke = pytest.mark.skipif(
+    not GOOGLE_KEY, reason="set GEMINI_API_KEY for Google provider smoke tests"
 )
 
 
@@ -57,12 +61,14 @@ async def responder_answer(settings: Settings, question: str):
     return answers[0]
 
 
+@google_smoke
 async def test_gemini_36_fixed_horizon_with_screenshot():
     settings = Settings(api_key=GOOGLE_KEY or "")
     answer = await responder_answer(settings, "Briefly describe what I reached.")
     assert isinstance(answer, str)
 
 
+@google_smoke
 async def test_gemini_36_react_forces_read_journal():
     settings = Settings(api_key=GOOGLE_KEY or "", responder_mode="react")
     answer = await responder_answer(settings, "What did I reach?")
@@ -90,7 +96,10 @@ async def _live_checkpoint(text: str) -> tuple[int, int]:
     from google import genai
     from google.genai import types
 
-    settings = Settings(api_key=GOOGLE_KEY or "")
+    settings = Settings(
+        api_key=GOOGLE_KEY or "",
+        observer_model="live/gemini-3.1-flash-live-preview",
+    )
     journal = JournalService(JournalLog())
     observer = ObserverSessionManager(settings, journal)
     client = genai.Client(api_key=GOOGLE_KEY)
@@ -125,6 +134,7 @@ async def _live_checkpoint(text: str) -> tuple[int, int]:
     return calls, completed
 
 
+@google_smoke
 async def test_live_manual_video_checkpoint_can_call_record_event():
     calls, completed = await _live_checkpoint(
         "QUEST COMPLETE: Restored power to the named Moon Tower"
@@ -133,16 +143,21 @@ async def test_live_manual_video_checkpoint_can_call_record_event():
     assert calls >= 1
 
 
+@google_smoke
 async def test_live_no_event_checkpoint_finishes_without_visible_output():
     calls, completed = await _live_checkpoint("ordinary unchanged pause menu")
     assert completed == 1
     assert calls == 0
 
 
+@google_smoke
 async def test_live_fresh_connection_accepts_a_journal_seed():
     from google import genai
 
-    settings = Settings(api_key=GOOGLE_KEY or "")
+    settings = Settings(
+        api_key=GOOGLE_KEY or "",
+        observer_model="live/gemini-3.1-flash-live-preview",
+    )
     journal = JournalService(JournalLog())
     journal.record("Reached Moon Tower.", "location")
     observer = ObserverSessionManager(settings, journal)
@@ -155,3 +170,48 @@ async def test_live_fresh_connection_accepts_a_journal_seed():
     observer._resumption_handle = "discard-me"
     observer.rotate("smoke fresh rotation", fresh=True)
     assert observer._resumption_handle is None
+
+
+async def _batched_observer_smoke(settings: Settings, qapp) -> None:
+    journal = JournalService(JournalLog())
+    observer = NonLiveObserverSessionManager(settings, journal)
+    calls, runs, errors = [], [], []
+    observer.llmCall.connect(calls.append)
+    observer.observerRan.connect(runs.append)
+    observer.errorOccurred.connect(errors.append)
+    first = screenshot("ENTERED NAMED LOCATION: Moon Tower")
+    second = screenshot("QUEST COMPLETE: Restored power to Moon Tower")
+    observer.start()
+    observer.observe(first)
+    observer.observe(second)
+    await observer.stop(timeout=90)
+    assert not errors, errors
+    assert observer.last_observed_at == second.captured_at
+    assert runs and runs[0]["source_frame_count"] == 2
+    assert calls and all(call.kind == "nonlive_observer" for call in calls)
+    assert all(
+        entry.timestamp in {first.captured_at, second.captured_at}
+        for entry in journal.snapshot().entries
+    )
+
+
+@google_smoke
+async def test_google_batched_video_schema_timestamp_and_usage(qapp):
+    await _batched_observer_smoke(Settings(api_key=GOOGLE_KEY or ""), qapp)
+
+
+async def test_openrouter_batched_video_schema_timestamp_and_usage(qapp):
+    model = os.environ.get("CHIRON_OPENROUTER_VIDEO_SMOKE_MODEL", "")
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not model or not key:
+        pytest.skip("set OPENROUTER_API_KEY and CHIRON_OPENROUTER_VIDEO_SMOKE_MODEL")
+    await _batched_observer_smoke(
+        Settings(
+            openrouter_api_key=key,
+            observer_model=(
+                model if model.startswith("openrouter/") else f"openrouter/{model}"
+            ),
+            responder_model="openrouter/google/gemini-2.5-flash",
+        ),
+        qapp,
+    )

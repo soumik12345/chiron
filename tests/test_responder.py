@@ -30,6 +30,25 @@ def test_live_before_the_first_successful_checkpoint_is_still_stale():
     assert snapshot.stale is True
 
 
+def test_batched_freshness_distinguishes_sampled_pending_and_processed():
+    snapshot = ObserverStatus(
+        state="watching",
+        watch_requested=True,
+        mode="nonlive",
+        accepting_frames=True,
+        last_sampled_at=110.0,
+        last_observed_at=100.0,
+        pending_frames=2,
+    )
+    from chiron.responder.prompts import observer_context
+
+    rendered = observer_context(snapshot)
+    assert snapshot.stale is True
+    assert "pending Observer frames: 2" in rendered
+    assert "newest frame processed" in rendered
+    assert "newest frame sampled" in rendered
+
+
 def frame() -> Frame:
     return Frame(jpeg=b"pixels", captured_at=1_700_000_000, width=8, height=4)
 

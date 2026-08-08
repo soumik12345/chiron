@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from chiron.config.settings import OverlaySettings, Settings
+from chiron.config.settings import OverlaySettings
 from chiron.journal.log import JournalEntry
 from chiron.ui.journal_drawer import (
     GAP_POINTS,
@@ -271,7 +271,9 @@ async def test_saving_settings_does_not_close_the_drawer(app):
     """
     app.overlay.set_journal_open(True)
 
-    app.apply_settings(Settings(game_name="Elden Ring"))
+    changed = app.settings.copy_deep()
+    changed.game_name = "Elden Ring"
+    app.apply_settings(changed)
 
     assert app.overlay.journal_open is True
     assert app.settings.overlay.journal_open is True

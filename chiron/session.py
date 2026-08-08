@@ -1,8 +1,9 @@
 """Narrow contracts for Chiron's two permanent runtime agents.
 
 The Observer and Responder deliberately do not share a provider interface. The
-Observer owns the Gemini Live socket and can only write journal observations;
-the Responder owns user-visible answers and can only read a journal snapshot.
+Observer owns either a Gemini Live socket or a buffered request pipeline and can
+only write journal observations; the Responder owns user-visible answers and can
+only read a journal snapshot.
 ``ChironApp`` constructs both, so changing a Responder model can never turn off
 or replace visual observation.
 """
@@ -22,28 +23,38 @@ class ObserverStatus:
 
     state: str
     watch_requested: bool
+    mode: str = "live"
+    accepting_frames: bool = True
+    last_sampled_at: float | None = None
     last_observed_at: float | None = None
+    pending_frames: int = 0
+    next_process_at: float | None = None
     detail: str = ""
 
     @property
     def stale(self) -> bool:
         """Whether a question cannot be grounded in a current live span."""
-        return not (
-            self.watch_requested
-            and self.state == "live"
-            and self.last_observed_at is not None
-        )
+        if not self.watch_requested or self.last_observed_at is None:
+            return True
+        if self.mode == "live":
+            return not self.accepting_frames
+        return not self.accepting_frames or self.pending_frames > 0
 
 
 @runtime_checkable
 class ObserverAgent(Protocol):
-    """Tool-only Live observer surface used by the application."""
+    """Write-only Observer surface used by the application."""
 
     status: str
     status_detail: str
+    mode: str
     detected_game: str
     session_id: str
+    accepting_frames: bool
+    last_sampled_at: float | None
     last_observed_at: float | None
+    pending_frames: int
+    next_process_at: float | None
 
     @property
     def frames_sent(self) -> int: ...

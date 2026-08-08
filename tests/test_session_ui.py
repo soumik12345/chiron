@@ -391,7 +391,8 @@ def test_a_compaction_is_recorded_and_announced(app):
 async def test_settings_changes_are_recorded_by_name(app):
     """Async because a changed instruction schedules a session restart."""
     app.set_watching(True)
-    changed = Settings(game_name="Elden Ring")
+    changed = app.settings.copy_deep()
+    changed.game_name = "Elden Ring"
 
     app.apply_settings(changed)
     app.recorder.flush()

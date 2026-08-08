@@ -340,6 +340,14 @@ class SessionRecorder(QObject):
             ts=entry.timestamp,
         )
 
+    def record_observer_run(self, payload: dict[str, Any]) -> None:
+        """Record one successful buffered review and mirror rescan counters."""
+        if self._store is None:
+            return
+        if self._row is not None:
+            self._row.observer_runs += 1
+        self._append("observer_run", ev.observer_run(**dict(payload)))
+
     def record_frame(
         self, frame: Frame, reason: str, *, agent_id: str | None = None
     ) -> str:

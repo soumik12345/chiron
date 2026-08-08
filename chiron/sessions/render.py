@@ -176,8 +176,12 @@ def render_events(
         elif event.type == "observer_run":
             if payload.get("skipped"):
                 continue
-            entries = int(payload.get("entries") or 0)
-            reason = html.escape(str(payload.get("reason") or "look"))
+            entries = int(
+                payload.get("journal_entry_count") or payload.get("entries") or 0
+            )
+            reason = html.escape(
+                str(payload.get("seal_reason") or payload.get("reason") or "look")
+            )
             noted = f"{entries} entries" if entries else "nothing new"
             blocks.append(
                 _block(
