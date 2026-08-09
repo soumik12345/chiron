@@ -12,15 +12,20 @@ from chiron.journal.log import CATEGORIES, JournalEntry, JournalLog
 RECORD_EVENT_DECLARATION: dict[str, Any] = {
     "name": "record_event",
     "description": (
-        "Record one durable gameplay fact that will still matter later. Ignore "
-        "routine motion, transient UI state, uncertainty, and repeats."
+        "Record one meaningful new gameplay event or materially changed scene as "
+        "visual memory for the Responder. Ignore unchanged scenes, routine motion, "
+        "transient UI state, and repeats."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "note": {
                 "type": "string",
-                "description": "One concrete, self-contained sentence.",
+                "description": (
+                    "One vivid, self-contained scene paragraph grounded in visible "
+                    "evidence. Include relevant setting, activity, entities, state "
+                    "changes, and outcome; explicitly qualify uncertain details."
+                ),
             },
             "category": {
                 "type": "string",

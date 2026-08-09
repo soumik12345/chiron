@@ -58,6 +58,17 @@ async def test_observer_tool_is_the_only_write_handler():
     assert len(service.log) == 1
 
 
+def test_observer_tool_requests_a_vivid_grounded_scene_paragraph():
+    declaration = JournalService(JournalLog()).function_declarations[0]
+    note = declaration["parameters"]["properties"]["note"]
+
+    assert "visual memory for the Responder" in declaration["description"]
+    assert "vivid, self-contained scene paragraph" in note["description"]
+    assert "qualify uncertain details" in note["description"]
+    assert set(declaration["parameters"]["properties"]) == {"note", "category"}
+    assert declaration["parameters"]["required"] == ["note"]
+
+
 async def test_empty_observer_tool_note_is_ignored():
     service = JournalService(JournalLog())
     result = await service.handle_observer_tool("record_event", {"note": " "})

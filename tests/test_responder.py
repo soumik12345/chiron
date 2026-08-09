@@ -230,6 +230,11 @@ def test_gemini_36_omits_temperature(manager):
     assert manager._model().temperature is None
 
 
+def test_responder_model_uses_the_selected_reasoning_effort(manager):
+    manager.settings.responder_reasoning_effort = "low"
+    assert manager._model().reasoning_effort == "low"
+
+
 def test_model_and_mode_changes_keep_conversation(manager):
     manager.conversation.commit("where?", "north")
     edited = manager.settings.copy_deep()

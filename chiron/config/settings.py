@@ -70,6 +70,7 @@ OPENROUTER_API_KEY_ENV_VARS = ("OPENROUTER_API_KEY",)
 
 MediaResolution = Literal["low", "medium", "high"]
 ResponderMode = Literal["fixed_horizon", "react"]
+ResponderReasoningEffort = Literal["none", "minimal", "low", "medium", "high"]
 QuestionFramePolicy = Literal["latest", "immediate"]
 ObserverMode = Literal["live", "nonlive"]
 
@@ -222,6 +223,8 @@ class Settings(BaseModel):
         responder_model (str): Non-live Google or OpenRouter model used only by
             Chiron-Responder.
         responder_mode (ResponderMode): Fixed-horizon or ReAct execution.
+        responder_reasoning_effort (ResponderReasoningEffort | None): Optional
+            provider-specific reasoning level. ``None`` leaves the model default.
         game_name (str): Optional name of the game being played, folded into the
             system instruction so the model knows what it is looking at.
         observer_system_prompt (str): Optional additions to Observer behavior.
@@ -236,6 +239,7 @@ class Settings(BaseModel):
     observer_model: str = DEFAULT_OBSERVER_MODEL
     responder_model: str = DEFAULT_RESPONDER_MODEL
     responder_mode: ResponderMode = "fixed_horizon"
+    responder_reasoning_effort: ResponderReasoningEffort | None = None
     game_name: str = ""
     observer_system_prompt: str = ""
     responder_system_prompt: str = ""
@@ -423,6 +427,7 @@ class Settings(BaseModel):
         return (
             self.responder_model != other.responder_model
             or self.responder_mode != other.responder_mode
+            or self.responder_reasoning_effort != other.responder_reasoning_effort
             or self.key_for_model(self.responder_model)
             != other.key_for_model(other.responder_model)
             or self.game_name != other.game_name
@@ -623,6 +628,7 @@ __all__ = [
     "QuestionFramePolicy",
     "RemovalPlan",
     "ResponderMode",
+    "ResponderReasoningEffort",
     "Settings",
     "default_settings_path",
     "is_live_selection",

@@ -33,12 +33,14 @@ class FakeProvider:
     def __init__(self, outputs):
         self.outputs = deque(outputs)
         self.calls = []
+        self.model_options = []
         self.failures = []
         self.max_in_flight = 0
         self.in_flight = 0
 
     def factory(self, **kwargs):
         provider = self
+        self.model_options.append(kwargs)
 
         class Model:
             async def acompletion(self, **call):
@@ -128,6 +130,7 @@ async def test_final_flush_maps_entries_to_source_capture_time(qapp):
     assert journal.snapshot().entries[0].timestamp == 105.5
     assert journal.snapshot().entries[0].note == "Defeated the guardian."
     assert delivered == [(source[0], "scheduled"), (source[1], "immediate")]
+    assert provider.model_options[0]["reasoning_effort"] == "none"
     assert observer.last_observed_at == 105.5
     assert observer.pending_frames == 0
     assert runs[0]["seal_reason"] == "final_flush"

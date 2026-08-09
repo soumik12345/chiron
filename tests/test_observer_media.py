@@ -14,6 +14,7 @@ from chiron.config.settings import Settings
 from chiron.journal.service import JournalSnapshot
 from chiron.observer.media import encode_mp4, encode_split_mp4
 from chiron.observer.structured import (
+    BATCHED_OBSERVER_SYSTEM_PROMPT,
     StructuredObserverError,
     build_batch_messages,
     journal_result_schema,
@@ -85,6 +86,21 @@ def test_schema_and_messages_carry_exact_second_mapping():
         ]
         == 1
     )
+
+
+def test_buffered_prompt_and_schema_request_vivid_grounded_visual_memory():
+    schema = journal_result_schema(2)
+    entry = schema["properties"]["entries"]["items"]
+    note = entry["properties"]["note"]
+
+    assert "visual memory for Chiron-Responder" in BATCHED_OBSERVER_SYSTEM_PROMPT
+    assert "vivid, self-contained paragraph" in BATCHED_OBSERVER_SYSTEM_PROMPT
+    assert "sequence supported by the sampled frames" in BATCHED_OBSERVER_SYSTEM_PROMPT
+    assert "explicitly qualified" in BATCHED_OBSERVER_SYSTEM_PROMPT
+    assert "empty entries array" in BATCHED_OBSERVER_SYSTEM_PROMPT
+    assert "vivid, self-contained scene paragraph" in note["description"]
+    assert set(entry["properties"]) == {"video_second", "category", "note"}
+    assert entry["required"] == ["video_second", "category", "note"]
 
 
 @pytest.mark.parametrize(

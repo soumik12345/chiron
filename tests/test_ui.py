@@ -483,6 +483,7 @@ def test_dual_agent_fields_round_trip(settings_window):
         observer_model="live/custom-observer",
         responder_model="openrouter/openai/gpt-4o",
         responder_mode="react",
+        responder_reasoning_effort="low",
         observer_system_prompt="record objectives",
         responder_system_prompt="avoid spoilers",
     )
@@ -494,6 +495,7 @@ def test_dual_agent_fields_round_trip(settings_window):
     assert collected.observer_model == "live/custom-observer"
     assert collected.responder_model == "openrouter/openai/gpt-4o"
     assert collected.responder_mode == "react"
+    assert collected.responder_reasoning_effort == "low"
     assert collected.observer_system_prompt == "record objectives"
     assert collected.responder_system_prompt == "avoid spoilers"
     assert collected.capture.question_frame_policy == "immediate"

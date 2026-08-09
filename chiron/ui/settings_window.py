@@ -283,6 +283,21 @@ class SettingsWindow(QWidget):
             "ReAct exposes only read_journal and forces it once on every request. "
             "Known models without function calling are hidden in that mode.",
         )
+        self.responder_reasoning_combo = self._wire(QComboBox(), "currentIndexChanged")
+        self.responder_reasoning_combo.addItem("Provider default", None)
+        for label, effort in (
+            ("None", "none"),
+            ("Minimal", "minimal"),
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+        ):
+            self.responder_reasoning_combo.addItem(label, effort)
+        form.addRow("Reasoning effort", self.responder_reasoning_combo)
+        self._hint(
+            form,
+            "Supported levels vary by model and provider. Provider default is safest.",
+        )
         self.game_name_edit = self._wire(QLineEdit(), "textEdited")
         self.game_name_edit.setPlaceholderText("e.g. Elden Ring; blank = detect window")
         form.addRow("Game", self.game_name_edit)
@@ -481,6 +496,14 @@ class SettingsWindow(QWidget):
             self.responder_mode_combo.setCurrentIndex(
                 max(0, self.responder_mode_combo.findData(settings.responder_mode))
             )
+            self.responder_reasoning_combo.setCurrentIndex(
+                max(
+                    0,
+                    self.responder_reasoning_combo.findData(
+                        settings.responder_reasoning_effort
+                    ),
+                )
+            )
             self.game_name_edit.setText(settings.game_name)
             self.observer_prompt_edit.setPlainText(settings.observer_system_prompt)
             self.responder_prompt_edit.setPlainText(settings.responder_system_prompt)
@@ -530,6 +553,9 @@ class SettingsWindow(QWidget):
             self.responder_model_picker.selection() or settings.responder_model
         )
         settings.responder_mode = self.responder_mode_combo.currentData()
+        settings.responder_reasoning_effort = (
+            self.responder_reasoning_combo.currentData()
+        )
         settings.game_name = self.game_name_edit.text().strip()
         settings.observer_system_prompt = (
             self.observer_prompt_edit.toPlainText().strip()

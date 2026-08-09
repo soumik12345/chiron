@@ -371,6 +371,7 @@ class ResponderSessionManager(QObject):
             api_key=self.settings.key_for_model(model_id) or None,
             temperature=None if "gemini-3.6" in model_id.lower() else 0.3,
             max_tokens=max_tokens,
+            reasoning_effort=self.settings.responder_reasoning_effort,
             usage_sink=self._on_usage,
             usage_labels={
                 "session_id": self.session_id or None,

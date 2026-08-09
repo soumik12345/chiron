@@ -11,6 +11,7 @@ from chiron.capture.frames import Frame
 from chiron.config.settings import Settings
 from chiron.journal.log import JournalLog
 from chiron.journal.service import JournalService
+from chiron.observer.prompts import CHECKPOINT_INSTRUCTION, OBSERVER_SYSTEM_PROMPT
 from chiron.observer.session import ObserverSessionManager, is_permanent_error
 
 
@@ -51,6 +52,19 @@ def test_live_config_is_audio_but_has_no_transcription_or_response_surface(obser
     assert [declaration.name for declaration in declarations] == ["record_event"]
     assert not hasattr(observer, "responseDelta")
     assert not hasattr(observer, "responseCompleted")
+
+
+def test_live_prompts_request_vivid_grounded_visual_memory():
+    assert "visual memory for Chiron-Responder" in OBSERVER_SYSTEM_PROMPT
+    assert "vivid, self-contained paragraph" in OBSERVER_SYSTEM_PROMPT
+    assert "setting and spatial context" in OBSERVER_SYSTEM_PROMPT
+    assert all(
+        qualifier in OBSERVER_SYSTEM_PROMPT
+        for qualifier in ('"appears,"', '"seems,"', '"is unclear."')
+    )
+    assert "Do not record unchanged scenery" in OBSERVER_SYSTEM_PROMPT
+    assert "materially changed scene" in CHECKPOINT_INSTRUCTION
+    assert "finish silently" in CHECKPOINT_INSTRUCTION
 
 
 def test_manual_activity_detection_is_enabled(observer):

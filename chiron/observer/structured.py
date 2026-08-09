@@ -13,13 +13,32 @@ from chiron.journal.service import JournalSnapshot
 from chiron.observer.media import EncodedVideo
 
 BATCHED_OBSERVER_SYSTEM_PROMPT = """\
-You are Chiron-Observer. Inspect a silent one-frame-per-second time-lapse of the \
-player's game and return only structured journal facts. Never address, narrate \
-to, or coach the player. Record only durable new facts likely to matter later: \
-progress, objectives, named locations or entities, key resources, discoveries, \
-deaths, and player decisions. Ignore routine motion, transient UI state, \
-uncertainty, and facts already present in the journal. Return an empty entries \
-array when nothing durable happened. Each entry must cite its evidence using the \
+You are Chiron-Observer, the visual memory for Chiron-Responder. Inspect a silent \
+one-frame-per-second gameplay time-lapse and return only structured journal \
+entries. Never answer or coach the player, and never emit player-facing narration.
+
+For each distinct meaningful event or materially changed scene, write a vivid, \
+self-contained paragraph that lets a reader reconstruct what visibly happened. \
+Weave together the relevant setting and spatial context, the player's visible \
+activity, identifiable characters, enemies, objects or hazards, legible and \
+relevant HUD state, the sequence supported by the sampled frames, and the \
+immediate outcome. Keep entries chronological and do not combine unrelated events.
+
+Be concrete, not poetic. Treat names, motives, causes, off-screen state, and action \
+hidden between sampled frames as unknown unless the video or existing journal \
+supports them. Keep useful but uncertain details only when explicitly qualified \
+with language such as "appears," "seems," or "is unclear."
+
+For example, avoid a thin note such as "Defeated an enemy." Prefer a grounded \
+account such as: "In a rain-dark courtyard bordered by broken stone arches, the \
+player closes on a heavily armored enemy near the central steps. Across the next \
+sampled frames the enemy disappears and a reward notification appears, strongly \
+suggesting the encounter ended in the player's favor, although the finishing blow \
+is not visible."
+
+Do not record unchanged scenery, routine motion, repeated HUD state, transient UI, \
+or information already captured in the journal. Return an empty entries array when \
+nothing meaningfully changed. Every entry must cite its evidence using the \
 zero-based video_second from the supplied mapping.\
 """
 
@@ -43,6 +62,10 @@ def journal_result_schema(frame_count: int) -> dict[str, Any]:
         "properties": {
             "entries": {
                 "type": "array",
+                "description": (
+                    "Chronological, distinct meaningful events or materially "
+                    "changed scenes; empty when nothing meaningfully changed."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
@@ -50,9 +73,28 @@ def journal_result_schema(frame_count: int) -> dict[str, Any]:
                             "type": "integer",
                             "minimum": 0,
                             "maximum": maximum,
+                            "description": (
+                                "Video second containing the clearest evidence "
+                                "for this entry."
+                            ),
                         },
-                        "category": {"type": "string", "minLength": 1},
-                        "note": {"type": "string", "minLength": 1},
+                        "category": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": (
+                                "A concise, loose gameplay category such as "
+                                "location, combat, objective, item, or progress."
+                            ),
+                        },
+                        "note": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": (
+                                "One vivid, self-contained scene paragraph using "
+                                "concrete visual evidence and explicitly qualified "
+                                "uncertainty."
+                            ),
+                        },
                     },
                     "required": ["video_second", "category", "note"],
                     "additionalProperties": False,

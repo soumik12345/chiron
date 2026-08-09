@@ -657,6 +657,7 @@ class NonLiveObserverSessionManager(QObject):
             api_key=batch.settings.key_for_model(model_id),
             temperature=0.2,
             max_tokens=1200,
+            reasoning_effort="none",
             usage_sink=usage_sink,
             usage_labels={
                 "session_id": batch.session_id or None,
