@@ -225,12 +225,14 @@ def test_load_repopulates_the_form(settings_window):
     settings = Settings()
     settings.capture.frame_width = 1024
     settings.capture.question_frame_policy = "immediate"
+    settings.capture.question_answer_policy = "flush_observer"
     settings.hotkeys.toggle_overlay = "ctrl+shift+g"
 
     settings_window.load(settings)
 
     assert settings_window.frame_width_spin.value() == 1024
     assert settings_window.question_policy_combo.currentData() == "immediate"
+    assert settings_window.question_answer_combo.currentData() == "flush_observer"
     assert settings_window.toggle_hotkey_edit.text() == "ctrl+shift+g"
 
 
@@ -488,6 +490,7 @@ def test_dual_agent_fields_round_trip(settings_window):
         responder_system_prompt="avoid spoilers",
     )
     settings.capture.question_frame_policy = "immediate"
+    settings.capture.question_answer_policy = "flush_observer"
     settings.capture.media_resolution = "high"
     settings_window.load(settings)
 
@@ -499,6 +502,7 @@ def test_dual_agent_fields_round_trip(settings_window):
     assert collected.observer_system_prompt == "record objectives"
     assert collected.responder_system_prompt == "avoid spoilers"
     assert collected.capture.question_frame_policy == "immediate"
+    assert collected.capture.question_answer_policy == "flush_observer"
     assert collected.capture.media_resolution == "high"
 
 

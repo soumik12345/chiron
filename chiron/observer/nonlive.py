@@ -267,6 +267,14 @@ class NonLiveObserverSessionManager(QObject):
         if len(self._active) >= SAMPLE_CAP:
             self._seal("sample_cap")
 
+    async def flush_and_wait(self) -> bool:
+        """Review every frame accepted so far, returning false for a retained batch."""
+        self._seal("question")
+        task = self._processing_task
+        if task is not None and not task.done():
+            await asyncio.shield(task)
+        return not self._sealed
+
     def reset_memory(self) -> None:
         if self.pending_frames:
             raise RuntimeError("Cannot reset Observer memory while frames are pending")

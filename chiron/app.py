@@ -50,6 +50,7 @@ _FOOTER_INTERVAL_MS = 1000
 class _PendingQuestion:
     text: str
     immediate: bool
+    flush_observer: bool
 
 
 class ChironApp(QObject):
@@ -72,6 +73,11 @@ class ChironApp(QObject):
         self._latest_frame: Frame | None = None
         self._questions: deque[_PendingQuestion] = deque()
         self._waiting_immediate: tuple[int, _PendingQuestion] | None = None
+        self._flushing_question: tuple[_PendingQuestion, Frame | None] | None = None
+        self._blocked_flush_question: tuple[_PendingQuestion, Frame | None] | None = (
+            None
+        )
+        self._flush_task: asyncio.Task[None] | None = None
         self._question_token = 0
         self._observer_drain_action: str | None = None
 
@@ -237,6 +243,7 @@ class ChironApp(QObject):
         return session_id
 
     def new_session(self) -> None:
+        self._clear_flush_question()
         if getattr(self.observer, "pending_frames", 0):
             self._observer_drain_action = "new_session"
             self.capture.set_watching(False)
@@ -277,6 +284,7 @@ class ChironApp(QObject):
         self._invalidate_frames()
         self._questions.clear()
         self._waiting_immediate = None
+        self._clear_flush_question()
         self.overlay.clear_transcript()
         self.overlay.clear_journal()
         self.overlay.show_play()
@@ -439,7 +447,10 @@ class ChironApp(QObject):
         self.ensure_session()
         self.recorder.record_message("user", text, agent_id="responder")
         immediate = self.settings.capture.question_frame_policy == "immediate"
-        self._questions.append(_PendingQuestion(text, immediate))
+        flush_observer = (
+            self.settings.capture.question_answer_policy == "flush_observer"
+        )
+        self._questions.append(_PendingQuestion(text, immediate, flush_observer))
         if not self.capture_active and not self._warned_not_watching:
             self._warned_not_watching = True
             self.overlay.append_system(
@@ -449,7 +460,11 @@ class ChironApp(QObject):
         self._resolve_questions()
 
     def _resolve_questions(self) -> None:
-        if self._waiting_immediate is not None:
+        if (
+            self._waiting_immediate is not None
+            or self._flushing_question is not None
+            or self._blocked_flush_question is not None
+        ):
             return
         while self._questions:
             question = self._questions.popleft()
@@ -461,7 +476,8 @@ class ChironApp(QObject):
                     return
                 self._waiting_immediate = None
             frame = self._latest_frame if self.capture_active else None
-            self._submit_question(question, frame)
+            if self._begin_flush_or_submit(question, frame):
+                return
 
     def _submit_question(self, question: _PendingQuestion, frame: Frame | None) -> None:
         if frame is not None:
@@ -472,6 +488,73 @@ class ChironApp(QObject):
             )
         self.responder.ask(question.text, frame, self._observer_snapshot())
 
+    def _begin_flush_or_submit(
+        self, question: _PendingQuestion, frame: Frame | None
+    ) -> bool:
+        flush = getattr(self.observer, "flush_and_wait", None)
+        if (
+            not question.flush_observer
+            or not self.capture_active
+            or getattr(self.observer, "mode", "live") != "nonlive"
+            or flush is None
+        ):
+            self._submit_question(question, frame)
+            return False
+        self._flushing_question = (question, frame)
+        self.overlay.append_system("Reviewing recent gameplay before answering.")
+        task = self._schedule(self._flush_observer_then_submit(flush, question, frame))
+        if task is None:
+            self._flushing_question = None
+            self._submit_question(question, frame)
+            return False
+        self._flush_task = task
+        return True
+
+    async def _flush_observer_then_submit(
+        self,
+        flush: Callable[[], object],
+        question: _PendingQuestion,
+        frame: Frame | None,
+    ) -> None:
+        try:
+            completed = await flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # the normal retained-batch path returns false
+            logger.warning("Observer question flush failed: %s", error)
+            completed = False
+        finally:
+            if self._flushing_question == (question, frame):
+                self._flushing_question = None
+                self._flush_task = None
+        if not completed:
+            self._blocked_flush_question = (question, frame)
+            self.overlay.append_system(
+                "⚠ Observer review did not finish; this question is waiting for "
+                "Retry review or Discard."
+            )
+            return
+        self._submit_question(question, frame)
+        self._resolve_questions()
+
+    def _clear_flush_question(self) -> None:
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+        self._flushing_question = None
+        self._blocked_flush_question = None
+        self._flush_task = None
+
+    def _resume_blocked_flush_question(self, *, discarded: bool = False) -> None:
+        pending, self._blocked_flush_question = self._blocked_flush_question, None
+        if pending is None:
+            return
+        if discarded:
+            self.overlay.append_system(
+                "Observer frames were discarded; answering with the existing journal."
+            )
+        self._submit_question(*pending)
+        self._resolve_questions()
+
     def _on_immediate_frame(self, frame: Frame, token: object) -> None:
         waiting = self._waiting_immediate
         if waiting is None or token != waiting[0]:
@@ -480,7 +563,7 @@ class ChironApp(QObject):
         question = waiting[1]
         if self.capture_active and self.observer.accepting_frames:
             self.observer.observe(frame, "immediate")
-            self._submit_question(question, frame)
+            self._begin_flush_or_submit(question, frame)
         else:
             self._submit_question(question, None)
         self._resolve_questions()
@@ -790,6 +873,7 @@ class ChironApp(QObject):
         if not completed:
             return
         self.overlay.set_observer_recovery(0)
+        self._resume_blocked_flush_question()
         await self._finish_observer_drain_action()
 
     def discard_observer_batch(self) -> None:
@@ -806,6 +890,7 @@ class ChironApp(QObject):
             f"{count} captured frames were not observed",
             agent_id="observer",
         )
+        self._resume_blocked_flush_question(discarded=True)
         self._schedule(self._finish_observer_drain_action())
 
     async def _finish_observer_drain_action(self) -> None:

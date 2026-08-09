@@ -147,6 +147,22 @@ async def test_empty_success_advances_freshness_without_journal_write(qapp):
     assert len(journal.snapshot().entries) == 0
 
 
+async def test_question_flush_seals_and_waits_for_the_review(qapp):
+    provider = FakeProvider(
+        [
+            response(
+                {"entries": [{"video_second": 0, "category": "note", "note": "Now."}]}
+            )
+        ]
+    )
+    observer, journal = manager(provider)
+    observer.start()
+    observer.observe(frame(250.0))
+
+    assert await observer.flush_and_wait() is True
+    assert [entry.note for entry in journal.snapshot().entries] == ["Now."]
+
+
 async def test_malformed_output_is_billed_and_repaired_exactly_once(qapp):
     invalid = response(
         {"entries": [{"video_second": 99, "category": "x", "note": "x"}]}

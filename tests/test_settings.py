@@ -27,6 +27,7 @@ def test_fresh_install_defaults_to_two_explicit_agents():
     assert settings.capture.interval_seconds == 5.0
     assert settings.capture.process_interval_seconds == 300.0
     assert settings.capture.question_frame_policy == "latest"
+    assert settings.capture.question_answer_policy == "immediate"
 
 
 def test_round_trip_writes_only_the_v3_shape(tmp_path):
@@ -34,6 +35,7 @@ def test_round_trip_writes_only_the_v3_shape(tmp_path):
     settings.capture.interval_seconds = 6.5
     settings.responder_mode = "react"
     settings.responder_reasoning_effort = "low"
+    settings.capture.question_answer_policy = "flush_observer"
     path = tmp_path / "settings.json"
 
     save_settings(settings, path)
@@ -44,6 +46,7 @@ def test_round_trip_writes_only_the_v3_shape(tmp_path):
     assert loaded.capture.interval_seconds == 6.5
     assert loaded.responder_mode == "react"
     assert loaded.responder_reasoning_effort == "low"
+    assert loaded.capture.question_answer_policy == "flush_observer"
     assert "selected_model" not in raw
     assert "agent_mode" not in raw
     assert "observer" not in raw

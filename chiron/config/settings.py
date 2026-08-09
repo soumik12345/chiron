@@ -72,6 +72,7 @@ MediaResolution = Literal["low", "medium", "high"]
 ResponderMode = Literal["fixed_horizon", "react"]
 ResponderReasoningEffort = Literal["none", "minimal", "low", "medium", "high"]
 QuestionFramePolicy = Literal["latest", "immediate"]
+QuestionAnswerPolicy = Literal["immediate", "flush_observer"]
 ObserverMode = Literal["live", "nonlive"]
 
 
@@ -108,6 +109,9 @@ class CaptureSettings(BaseModel):
             Gemini Live accepts at most one video frame per second.
         question_frame_policy (QuestionFramePolicy): Reuse the latest scheduled
             frame, or capture exactly one new frame for a question.
+        question_answer_policy (QuestionAnswerPolicy): Answer from the current
+            journal immediately, or wait for the buffered Observer to review its
+            active frames first.
         frame_width (int): Frames are downscaled to this width before encoding.
         jpeg_quality (int): JPEG quality (1-95) for encoded frames.
         stamp_timestamp (bool): Draw the capture time into the frame's corner so
@@ -126,6 +130,7 @@ class CaptureSettings(BaseModel):
     interval_seconds: float = Field(default=5.0, ge=1.0, le=60.0)
     process_interval_seconds: float = Field(default=300.0, ge=30.0, le=1800.0)
     question_frame_policy: QuestionFramePolicy = "latest"
+    question_answer_policy: QuestionAnswerPolicy = "immediate"
     frame_width: int = Field(default=768, ge=256, le=1920)
     jpeg_quality: int = Field(default=60, ge=10, le=95)
     stamp_timestamp: bool = True
@@ -626,6 +631,7 @@ __all__ = [
     "MediaResolution",
     "OverlaySettings",
     "QuestionFramePolicy",
+    "QuestionAnswerPolicy",
     "RemovalPlan",
     "ResponderMode",
     "ResponderReasoningEffort",

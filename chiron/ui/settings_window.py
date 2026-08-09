@@ -355,6 +355,17 @@ class SettingsWindow(QWidget):
             "Immediate captures exactly one extra frame and does not move the next "
             "periodic deadline.",
         )
+        self.question_answer_combo = self._wire(QComboBox(), "currentIndexChanged")
+        self.question_answer_combo.addItem("Answer immediately", "immediate")
+        self.question_answer_combo.addItem(
+            "Flush Observer before answering", "flush_observer"
+        )
+        form.addRow("Question answer", self.question_answer_combo)
+        self._hint(
+            form,
+            "Flush waits for the buffered Observer to review pending frames and "
+            "commit its journal entries. It does not apply to Live observation.",
+        )
         self.burn_label = self._hint(form)
         self.burn_label.setStyleSheet(f"color: {PALETTE['accent']};")
 
@@ -520,6 +531,12 @@ class SettingsWindow(QWidget):
                     self.question_policy_combo.findData(capture.question_frame_policy),
                 )
             )
+            self.question_answer_combo.setCurrentIndex(
+                max(
+                    0,
+                    self.question_answer_combo.findData(capture.question_answer_policy),
+                )
+            )
             self.frame_width_spin.setValue(capture.frame_width)
             self.media_res_combo.setCurrentText(capture.media_resolution)
             self.jpeg_quality_spin.setValue(capture.jpeg_quality)
@@ -571,6 +588,9 @@ class SettingsWindow(QWidget):
         settings.capture.process_interval_seconds = self.process_interval_spin.value()
         settings.capture.question_frame_policy = (
             self.question_policy_combo.currentData()
+        )
+        settings.capture.question_answer_policy = (
+            self.question_answer_combo.currentData()
         )
         settings.capture.frame_width = self.frame_width_spin.value()
         settings.capture.media_resolution = self.media_res_combo.currentText()

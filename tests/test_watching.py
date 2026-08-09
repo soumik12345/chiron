@@ -139,6 +139,46 @@ def test_immediate_frame_reaches_both_agents_without_waiting_for_observer(app):
     assert app.responder.questions[-1][1] is current
 
 
+async def test_flush_before_answering_waits_for_buffered_observer(app):
+    app.settings.capture.question_answer_policy = "flush_observer"
+    app.observer.mode = "nonlive"
+    flushed = []
+
+    async def flush_and_wait():
+        flushed.append(True)
+        app.journal_service.record("Observed before answering.", "progress")
+        return True
+
+    app.observer.flush_and_wait = flush_and_wait
+    app.set_watching(True)
+    app._on_scheduled_frame(frame(100.0))
+    app._on_prompt("what changed?")
+
+    assert app.responder.questions == []
+    await settle()
+
+    assert flushed == [True]
+    assert len(app.journal) == 1
+    assert app.responder.questions[-1][0] == "what changed?"
+
+
+async def test_failed_flush_keeps_the_question_pending_for_observer_recovery(app):
+    app.settings.capture.question_answer_policy = "flush_observer"
+    app.observer.mode = "nonlive"
+
+    async def flush_and_wait():
+        return False
+
+    app.observer.flush_and_wait = flush_and_wait
+    app.set_watching(True)
+    app._on_prompt("what changed?")
+    await settle()
+
+    assert app.responder.questions == []
+    assert app._blocked_flush_question is not None
+    assert "waiting for Retry review or Discard" in app.overlay.transcript.toPlainText()
+
+
 def test_an_immediate_request_degrades_if_observer_disconnects(app):
     app.settings.capture.question_frame_policy = "immediate"
     app.set_watching(True)
